@@ -1,0 +1,5 @@
+/target/
+/tools/
+/test-media/
+/artifacts/
+*.log
