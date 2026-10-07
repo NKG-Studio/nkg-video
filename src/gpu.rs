@@ -131,17 +131,16 @@ impl Drop for Frame {
     }
 }
 
-struct SoftwareUpload {
-    input: wgpu::Texture,
+struct VideoPass {
     output: wgpu::Texture,
     view: wgpu::TextureView,
-    bind: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
+    beauty: bool,
 }
-impl SoftwareUpload {
-    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+impl VideoPass {
+    fn new(device: &wgpu::Device, width: u32, height: u32, beauty: bool) -> Self {
         let descriptor = wgpu::TextureDescriptor {
-            label: Some("Software video upload"),
+            label: Some("Processed video"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -151,24 +150,19 @@ impl SoftwareUpload {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        };
-        let input = device.create_texture(&descriptor);
-        let output = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Premultiplied video"),
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::COPY_SRC,
-            ..descriptor
-        });
+            view_formats: &[],
+        };
+        let output = device.create_texture(&descriptor);
         let view = output.create_view(&Default::default());
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Video alpha premultiplication"),
+            label: Some("Video beauty and alpha"),
             source: wgpu::ShaderSource::Wgsl(include_str!("alpha.wgsl").into()),
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Video alpha"),
+            label: Some("Video processing"),
             layout: None,
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -178,7 +172,7 @@ impl SoftwareUpload {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
+                entry_point: Some(if beauty { "fs_beauty" } else { "fs_main" }),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: descriptor.format,
@@ -192,35 +186,26 @@ impl SoftwareUpload {
             multiview: None,
             cache: None,
         });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Video alpha input"),
-            layout: &pipeline.get_bind_group_layout(0),
+        Self {
+            output,
+            view,
+            pipeline,
+            beauty,
+        }
+    }
+    fn bind(&self, device: &wgpu::Device, input: &wgpu::Texture) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Video processing input"),
+            layout: &self.pipeline.get_bind_group_layout(0),
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(
                     &input.create_view(&Default::default()),
                 ),
             }],
-        });
-        Self {
-            input,
-            output,
-            view,
-            bind,
-            pipeline,
-        }
+        })
     }
-    fn upload(&self, device: &wgpu::Device, queue: &wgpu::Queue, rgba: &[u8]) {
-        queue.write_texture(
-            self.input.as_image_copy(),
-            rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(self.input.width() * 4),
-                rows_per_image: None,
-            },
-            self.input.size(),
-        );
+    fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue, bind: &wgpu::BindGroup) {
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -235,10 +220,46 @@ impl SoftwareUpload {
                 ..Default::default()
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_bind_group(0, bind, &[]);
             pass.draw(0..3, 0..1);
         }
         queue.submit([encoder.finish()]);
+    }
+}
+
+struct SoftwareUpload {
+    input: wgpu::Texture,
+    bind: wgpu::BindGroup,
+    pass: VideoPass,
+}
+impl SoftwareUpload {
+    fn new(device: &wgpu::Device, width: u32, height: u32, beauty: bool) -> Self {
+        let pass = VideoPass::new(device, width, height, beauty);
+        let input = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Software video upload"),
+            size: pass.output.size(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let bind = pass.bind(device, &input);
+        Self { input, bind, pass }
+    }
+    fn upload(&self, device: &wgpu::Device, queue: &wgpu::Queue, rgba: &[u8]) {
+        queue.write_texture(
+            self.input.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.input.width() * 4),
+                rows_per_image: None,
+            },
+            self.input.size(),
+        );
+        self.pass.render(device, queue, &self.bind);
     }
 }
 
@@ -246,6 +267,8 @@ pub struct Display {
     pub state: RenderState,
     pub id: Option<egui::TextureId>,
     software: Option<SoftwareUpload>,
+    beauty_pass: Option<VideoPass>,
+    pub beauty: bool,
 }
 impl Display {
     pub fn new(state: RenderState) -> Self {
@@ -253,6 +276,8 @@ impl Display {
             state,
             id: None,
             software: None,
+            beauty_pass: None,
+            beauty: false,
         }
     }
     pub fn show_rgba(&mut self, rgba: &[u8], width: usize, height: usize) -> Result<(), String> {
@@ -265,20 +290,21 @@ impl Display {
         {
             return Err("Invalid software video texture dimensions or pixels".into());
         }
-        if self
-            .software
-            .as_ref()
-            .is_none_or(|s| s.input.width() != width as u32 || s.input.height() != height as u32)
-        {
+        if self.software.as_ref().is_none_or(|s| {
+            s.input.width() != width as u32
+                || s.input.height() != height as u32
+                || s.pass.beauty != self.beauty
+        }) {
             self.software = Some(SoftwareUpload::new(
                 &self.state.device,
                 width as u32,
                 height as u32,
+                self.beauty,
             ));
         }
         let upload = self.software.as_ref().unwrap();
         upload.upload(&self.state.device, &self.state.queue, rgba);
-        let view = upload.output.create_view(&Default::default());
+        let view = upload.pass.output.create_view(&Default::default());
         self.show_view(&view);
         Ok(())
     }
@@ -289,7 +315,26 @@ impl Display {
             width as u32,
             height as u32,
         )?;
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = if self.beauty {
+            if self
+                .beauty_pass
+                .as_ref()
+                .is_none_or(|p| p.output.size() != texture.size())
+            {
+                self.beauty_pass = Some(VideoPass::new(
+                    &self.state.device,
+                    width as u32,
+                    height as u32,
+                    true,
+                ));
+            }
+            let pass = self.beauty_pass.as_ref().unwrap();
+            let bind = pass.bind(&self.state.device, texture);
+            pass.render(&self.state.device, &self.state.queue, &bind);
+            pass.output.create_view(&Default::default())
+        } else {
+            texture.create_view(&Default::default())
+        };
         self.show_view(&view);
         Ok(())
     }
@@ -315,6 +360,7 @@ impl Display {
             self.state.renderer.write().free_texture(&id);
         }
         self.software = None;
+        self.beauty_pass = None;
     }
 }
 impl Drop for Display {
@@ -401,7 +447,11 @@ mod tests {
             .flat_map(|a| (0..=255u8).flat_map(move |v| [v, 255 - v, v / 2, a]))
             .collect();
         display.show_rgba(&pixels, 256, 256).unwrap();
-        let actual = read_rgba(&device, &queue, &display.software.as_ref().unwrap().output);
+        let actual = read_rgba(
+            &device,
+            &queue,
+            &display.software.as_ref().unwrap().pass.output,
+        );
         for (rgba, result) in pixels.chunks_exact(4).zip(actual.chunks_exact(4)) {
             let expected =
                 egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3])
@@ -531,6 +581,155 @@ mod tests {
         println!("alpha={} {count} frames: {:.3}ms {:.1}fps wait={waits:?} prepare+upload={uploads:?}; includes GPU completion, excludes presentation",
             if legacy { "CPU" } else { "GPU" }, elapsed.as_secs_f64()*1000.0, count as f64/elapsed.as_secs_f64());
     }
+    #[test]
+    #[ignore = "requires DX12 hardware"]
+    fn beauty_preserves_alpha_edges_and_toggle() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+                .unwrap();
+        let renderer = eframe::egui_wgpu::Renderer::new(
+            &device,
+            wgpu::TextureFormat::Bgra8Unorm,
+            None,
+            1,
+            false,
+        );
+        let mut display = Display::new(RenderState {
+            adapter,
+            available_adapters: Vec::new(),
+            device: device.clone(),
+            queue: queue.clone(),
+            target_format: wgpu::TextureFormat::Bgra8Unorm,
+            renderer: Arc::new(egui::mutex::RwLock::new(renderer)),
+        });
+        let pixels: Vec<u8> = (0..16)
+            .flat_map(|y| {
+                (0..16).flat_map(move |x| {
+                    if x < 8 {
+                        let noise = if (x + y) % 2 == 0 { 0 } else { 12 };
+                        [180 + noise, 120 + noise, 95 + noise, 255]
+                    } else {
+                        [0, 0, 255, 255]
+                    }
+                })
+            })
+            .collect();
+        display.show_rgba(&pixels, 16, 16).unwrap();
+        let id = display.id;
+        let original = read_rgba(
+            &device,
+            &queue,
+            &display.software.as_ref().unwrap().pass.output,
+        );
+        display.beauty = true;
+        display.show_rgba(&pixels, 16, 16).unwrap();
+        let beauty = read_rgba(
+            &device,
+            &queue,
+            &display.software.as_ref().unwrap().pass.output,
+        );
+        let channel = |x: usize, y: usize| (y * 16 + x) * 4;
+        assert!(
+            beauty[channel(3, 3)] > original[channel(3, 3)],
+            "skin should brighten"
+        );
+        assert!(
+            beauty[channel(3, 3)].abs_diff(beauty[channel(4, 3)]) < 12,
+            "small skin variations should smooth"
+        );
+        assert!(
+            beauty[channel(7, 3) + 2] < 130,
+            "blue must not bleed across the edge"
+        );
+        assert_eq!(
+            &beauty[channel(8, 3)..channel(16, 3)],
+            &pixels[channel(8, 3)..channel(16, 3)]
+        );
+        // Hardware frames use BGRA sRGB input; verify identical shader behavior.
+        let bgra = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let bgra_pixels: Vec<u8> = pixels
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect();
+        queue.write_texture(
+            bgra.as_image_copy(),
+            &bgra_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(64),
+                rows_per_image: None,
+            },
+            bgra.size(),
+        );
+        let pass = VideoPass::new(&device, 16, 16, true);
+        pass.render(&device, &queue, &pass.bind(&device, &bgra));
+        assert_eq!(beauty, read_rgba(&device, &queue, &pass.output));
+        display.beauty = false;
+        display.show_rgba(&pixels, 16, 16).unwrap();
+        assert_eq!(display.id, id);
+        assert_eq!(
+            original,
+            read_rgba(
+                &device,
+                &queue,
+                &display.software.as_ref().unwrap().pass.output
+            )
+        );
+        display.beauty = true;
+        let alpha: Vec<u8> = (0..=255u8).flat_map(|a| [180, 120, 95, a]).collect();
+        display.show_rgba(&alpha, 256, 1).unwrap();
+        let result = read_rgba(
+            &device,
+            &queue,
+            &display.software.as_ref().unwrap().pass.output,
+        );
+        assert_eq!(&result[..4], &[0, 0, 0, 0]);
+        for (a, p) in result.chunks_exact(4).enumerate() {
+            assert_eq!(p[3], a as u8);
+        }
+        // Hidden RGB at alpha=0 must have no influence on a neighboring skin pixel.
+        display
+            .show_rgba(&[180, 120, 95, 128, 255, 0, 0, 0], 2, 1)
+            .unwrap();
+        let edge = read_rgba(
+            &device,
+            &queue,
+            &display.software.as_ref().unwrap().pass.output,
+        );
+        display.show_rgba(&[180, 120, 95, 128], 1, 1).unwrap();
+        let single = read_rgba(
+            &device,
+            &queue,
+            &display.software.as_ref().unwrap().pass.output,
+        );
+        assert_eq!(&edge[..4], &single);
+        display.clear();
+        assert!(display.id.is_none());
+        assert!(display.software.is_none());
+        assert!(
+            display.beauty,
+            "selection should survive opening another video"
+        );
+    }
+
     #[test]
     #[ignore = "requires DX12 hardware and FFmpeg; optional NKG_BENCH_VIDEO"]
     fn gpu_decode_and_import() {

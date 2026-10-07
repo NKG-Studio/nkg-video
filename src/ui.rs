@@ -422,9 +422,11 @@ impl Player {
             if let Some(display) = &mut self.gpu_display {
                 let result = if let Some(gpu) = &frame.gpu {
                     Some(display.show(gpu, media.width, media.height))
-                } else if media.alpha {
+                } else if media.alpha || display.beauty {
                     Some(display.show_rgba(&frame.rgba, media.width, media.height))
                 } else {
+                    // A disabled filter must not leave its last output on screen.
+                    display.clear();
                     None
                 };
                 if let Some(result) = result {
@@ -815,6 +817,18 @@ impl Player {
             },
         );
         ui.checkbox(&mut self.checker, "透明棋盘格背景");
+        if let Some(display) = &mut self.gpu_display {
+            if ui
+                .checkbox(&mut display.beauty, "美颜（磨皮 / 美白）")
+                .on_hover_text("轻度磨皮和美白，按肤色估计处理范围")
+                .changed()
+            {
+                if let Some(frame) = self.raw.take() {
+                    self.display(frame, ctx);
+                }
+                ctx.request_repaint();
+            }
+        }
         if ui
             .button(if self.fullscreen {
                 "退出全屏                    F11"
@@ -1199,6 +1213,7 @@ impl eframe::App for Player {
             .show(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 let canvas = ui.interact(rect, ui.id().with("canvas"), egui::Sense::click());
+                canvas.context_menu(|ui| self.context_menu(ui, ctx));
                 let texture_id = self
                     .gpu_display
                     .as_ref()
@@ -1290,7 +1305,6 @@ impl eframe::App for Player {
                 } else if canvas.clicked() && self.media.is_some() {
                     self.toggle(ctx);
                 }
-                canvas.context_menu(|ui| self.context_menu(ui, ctx));
             });
         self.browser_ui(ctx);
         self.information_ui(ctx);

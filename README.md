@@ -37,6 +37,7 @@ cargo run --release
 - FFmpeg 覆盖的主流本地容器和编码，包括 MP4、MKV、MOV、WebM、AVI、TS 等；具体硬解能力由显卡、驱动和编码 profile 决定。
 - 优先 D3D11VA 硬解。通过解码器硬件配置及实际帧的 D3D11 格式验证硬解；首次打开硬解失败后才回退软件解码，在右键菜单「视频信息」中查看实际模式及回退原因。
 - 透明 WebM VP8/VP9 使用 libvpx 保留 Alpha；ProRes 4444 等含 Alpha 格式用软件解码。棋盘格/黑色背景切换，原始 RGBA 帧独立保留。
+- 视频右键菜单可勾选「美颜（磨皮 / 美白）」，默认关闭，会话内保留选择；暂停时切换也立即更新。使用 GPU 保边磨皮和轻度美白，兼容硬解、软解及透明视频，不改变原始帧和 Alpha。按肤色估计范围，也可能影响相近颜色的物体；不含人脸识别、瘦脸或 AI 修复。
 - 使用真实帧 PTS，支持可变帧率；定位时替换整个帧接收器，旧任务无法覆盖新帧。
 - 每个音视频流持有常驻解封装器和解码器，硬解设备及颜色转换器也会复用。跳转仅发送命令，执行 avformat_seek_file / avcodec_flush_buffers，替换有界帧队列；旧位置的数据无法进入新画面。到达 EOF 后仍保留解码器供重播。
 - 精确跳转先补解码至目标时间，再进行 GPU 颜色转换；兼容路径才进行回读。音频独立定位、重置重采样器并做预滚及样本裁剪，保留音轨偏移与静音间隔。
@@ -49,6 +50,8 @@ cargo run --release
 
 ```powershell
 cargo test
+# 美颜 GPU 像素检查（需要 Direct3D 12）
+cargo test beauty_preserves -- --ignored --nocapture
 ./scripts/make-test-media.ps1
 cargo test real_decode -- --ignored --nocapture
 cargo clippy --all-targets -- -D warnings
@@ -62,9 +65,9 @@ cargo test --release seek_latency -- --ignored --nocapture
 
 ## 当前边界
 
-这一版是基础播放器，尚未实现 AI、滤镜、字幕和 HDR 色彩管理。HDR 输入暂按 SDR RGBA 输出，不保证正确的 HDR 观感。
+这一版尚未实现 AI、字幕和 HDR 色彩管理。HDR 输入暂按 SDR RGBA 输出，不保证正确的 HDR 观感。
 
-默认链路：同一显卡上的 D3D11VA 解码 → D3D11 VideoProcessor 颜色转换 → D3D12 共享 BGRA 纹理 → wgpu / egui 显示。跨 API 使用共享 fence 在 GPU 队列上同步，正常帧不执行 CPU 回读、libswscale、CPU 像素复制或纹理重新上传。暂停及回退缓存保留独立的 GPU 纹理，可供后续 Shader 读取；滤镜与 AI 尚未接入，模型设备张量互操作仍需单独实现。
+默认链路：同一显卡上的 D3D11VA 解码 → D3D11 VideoProcessor 颜色转换 → D3D12 共享 BGRA 纹理 → 可选美颜 Shader → wgpu / egui 显示。跨 API 使用共享 fence 在 GPU 队列上同步，正常硬解帧不执行 CPU 回读、libswscale、CPU 像素复制或纹理重新上传。暂停及回退缓存保留独立的原始 GPU 纹理；美颜开启时复用一张输出纹理，关闭时绕过该处理。软件路径把美颜和 Alpha 预乘合并到一次 GPU 绘制。AI 尚未接入，模型设备张量互操作仍需单独实现。
 共享纹理首次初始化失败时回退到硬解加 CPU 回读的兼容路径，硬解也失败时才软解；透明格式继续使用保留 Alpha 的软件路径。实际模式和原因在视频信息中显示。不是所有格式与驱动都保证 GPU 互操作。
 
 `seek_latency` 同一解码会话内测量十个跳转落点，报告命令提交、目标帧解码完成、RGBA 转为 UI 图像后的时间；这不是显示器实际呈现耗时。长 GOP 仍需补解码，不能保证所有任意位置都在几毫秒内精确显示。测试同时覆盖连续替换请求、满队列、EOF 后重播，以及逐像素对比顺序解码和定位结果、PCM 样本一致性。
