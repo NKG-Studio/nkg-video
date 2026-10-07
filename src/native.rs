@@ -31,7 +31,8 @@ unsafe extern "C" {
     ) -> c_int;
     fn nkg_video_next(
         decoder: *mut c_void,
-        pixels: *mut *const u8,
+        pixels: *mut u8,
+        bytes: usize,
         width: *mut c_int,
         height: *mut c_int,
         pts: *mut f64,
@@ -56,6 +57,7 @@ pub struct Decoder {
     pub prefetch: Option<Arc<Mutex<VecDeque<Frame>>>>,
     resume_after: Option<f64>,
     gpu: bool,
+    spare: Vec<u8>,
 }
 impl Drop for Decoder {
     fn drop(&mut self) {
@@ -121,6 +123,7 @@ impl Decoder {
             prefetch: None,
             resume_after: None,
             gpu: hardware && !audio && media.gpu_device.is_some(),
+            spare: Vec::new(),
         })
     }
     fn result(&self, code: i32) -> Result<i32, String> {
@@ -220,22 +223,27 @@ impl Decoder {
             }
             return Ok(Some(frame));
         }
-        let (mut pixels, mut w, mut h, mut pts) = (ptr::null(), 0, 0, 0.0);
-        if self
-            .result(unsafe { nkg_video_next(self.handle, &mut pixels, &mut w, &mut h, &mut pts) })?
-            == 0
-        {
+        let (mut w, mut h, mut pts) = (0, 0, 0.0);
+        let bytes = self.width * self.height * 4;
+        self.spare.resize(bytes, 0);
+        let result = unsafe {
+            nkg_video_next(
+                self.handle,
+                self.spare.as_mut_ptr(),
+                bytes,
+                &mut w,
+                &mut h,
+                &mut pts,
+            )
+        };
+        if self.result(result)? == 0 {
             return Ok(None);
         }
-        if w as usize != self.width
-            || h as usize != self.height
-            || pixels.is_null()
-            || !pts.is_finite()
-        {
+        if w as usize != self.width || h as usize != self.height || !pts.is_finite() {
             return Err("Decoded frame dimensions or timestamp changed unexpectedly".into());
         }
-        // C retains its buffer until the next decoder call; copy before yielding to Rust's queue.
-        let bytes = self.width * self.height * 4;
+        // FFmpeg converts directly into an exclusively owned Rust buffer. Recycle only
+        // evicted pixels with no display/prefetch references, never overwrite cached frames.
         let capacity = (128 * 1024 * 1024 / bytes).min(120);
         let reusable = if !self.history.is_empty() && self.history.len() >= capacity {
             self.history
@@ -244,13 +252,7 @@ impl Decoder {
         } else {
             None
         };
-        let source = unsafe { std::slice::from_raw_parts(pixels, bytes) };
-        let rgba = if let Some(mut buffer) = reusable {
-            buffer.copy_from_slice(source);
-            buffer
-        } else {
-            source.to_vec()
-        };
+        let rgba = std::mem::replace(&mut self.spare, reusable.unwrap_or_default());
         let frame = Frame {
             gpu: None,
             rgba: Arc::new(rgba),
@@ -304,6 +306,113 @@ impl Decoder {
 
 #[cfg(test)]
 mod reverse_benchmark {
+    #[test]
+    #[ignore = "compare software RGBA against FFmpeg CLI; optional NKG_BENCH_VIDEO"]
+    fn software_rgba_matches_ffmpeg() {
+        use std::io::Read;
+        let path = std::env::var_os("NKG_BENCH_VIDEO")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "test-media/h264.mp4".into());
+        let media = crate::media::Media::probe(&path).unwrap();
+        let mut decoder = super::Decoder::open(&media, false, false).unwrap();
+        let mut command = crate::media::command("ffmpeg");
+        command.args(["-v", "error"]);
+        if media.alpha && (media.codec == "vp8" || media.codec == "vp9") {
+            command.args([
+                "-c:v",
+                if media.codec == "vp8" {
+                    "libvpx"
+                } else {
+                    "libvpx-vp9"
+                },
+            ]);
+        }
+        let mut process = command
+            .arg("-i")
+            .arg(&path)
+            .args([
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "300",
+                "-an",
+                "-sn",
+                "-dn",
+                "-fps_mode",
+                "passthrough",
+                "-pix_fmt",
+                "rgba",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = process.stdout.take().unwrap();
+        let mut expected = vec![0; media.width * media.height * 4];
+        let mut count = 0;
+        while let Some(frame) = decoder.video().unwrap() {
+            output.read_exact(&mut expected).unwrap();
+            assert!(
+                frame.rgba.as_slice() == expected,
+                "RGBA mismatch at frame {count}"
+            );
+            count += 1;
+            if count == 300 {
+                break;
+            }
+        }
+        assert_eq!(output.read(&mut [0]).unwrap(), 0);
+        assert!(process.wait().unwrap().success());
+        assert!(count > 0);
+        println!("{count} software frames exactly match FFmpeg RGBA");
+    }
+    #[test]
+    #[ignore = "software stage profile; optional NKG_BENCH_VIDEO"]
+    fn software_stage_profile() {
+        unsafe extern "C" {
+            fn nkg_video_profile(
+                decoder: *mut std::ffi::c_void,
+                decode: *mut i64,
+                convert: *mut i64,
+                read: *mut i64,
+            );
+        }
+        let path = std::env::var_os("NKG_BENCH_VIDEO")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "test-media/prores-alpha.mov".into());
+        let media = crate::media::Media::probe(&path).unwrap();
+        let mut decoder = super::Decoder::open(&media, false, false).unwrap();
+        let (mut decode, mut convert, mut read) = (0, 0, 0);
+        unsafe { nkg_video_profile(decoder.handle, &mut decode, &mut convert, &mut read) };
+        let mut native = std::time::Duration::ZERO;
+        let mut prepare = std::time::Duration::ZERO;
+        let mut image = eframe::egui::ColorImage {
+            size: [0, 0],
+            pixels: Vec::new(),
+        };
+        let mut frames = 0;
+        loop {
+            let start = std::time::Instant::now();
+            let Some(frame) = decoder.video().unwrap() else {
+                break;
+            };
+            native += start.elapsed();
+            let start = std::time::Instant::now();
+            frame.write_image(&media, &mut image);
+            std::hint::black_box(&image);
+            prepare += start.elapsed();
+            frames += 1;
+            if frames == 300 {
+                break;
+            }
+        }
+        unsafe { nkg_video_profile(decoder.handle, &mut decode, &mut convert, &mut read) };
+        assert!(frames > 0);
+        println!("{frames} frames: read+decode={decode}us (av_read_frame={read}us) native-convert={convert}us Rust-frame={}us CPU-image={}us; sequential stages, excludes GPU upload/presentation",
+            native.as_micros().saturating_sub((decode + convert) as u128), prepare.as_micros());
+    }
     #[test]
     #[ignore = "cold reverse with image preparation; optional NKG_BENCH_VIDEO"]
     fn cold_reverse() {

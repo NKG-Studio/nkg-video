@@ -3,6 +3,7 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavutil/time.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 #include <math.h>
@@ -21,15 +22,22 @@ typedef struct NkgDecoder {
     AVFrame *frame, *cpu;
     struct SwsContext *scale;
     SwrContext *resample;
-    uint8_t *buffer, *rotated;
-    unsigned int capacity, rotated_capacity;
+    uint8_t *buffer;
+    unsigned int capacity;
     int stream, draining, hardware, rotation;
     int scale_width, scale_height, scale_format;
     int color_space, color_range;
     double origin, target, audio_cursor;
     char error[256];
     void *gpu;
+    int profile;
+    int64_t decode_us, convert_us, read_us;
 } NkgDecoder;
+
+// Opt-in stage counters for the software-path benchmark; normal playback does not read the clock.
+void nkg_video_profile(NkgDecoder *d, int64_t *decode_us, int64_t *convert_us, int64_t *read_us) {
+    d->profile=1; *decode_us=d->decode_us; *convert_us=d->convert_us; *read_us=d->read_us;
+}
 
 static int fail(NkgDecoder *d, int code, const char *where) {
     char detail[128];
@@ -43,7 +51,6 @@ void nkg_close(NkgDecoder *d) {
     sws_freeContext(d->scale);
     swr_free(&d->resample);
     av_free(d->buffer);
-    av_free(d->rotated);
     av_frame_free(&d->frame);
     av_frame_free(&d->cpu);
     av_packet_free(&d->packet);
@@ -128,7 +135,9 @@ static int decode(NkgDecoder *d) {
         if (d->draining) return 0;
         do {
             av_packet_unref(d->packet);
+            int64_t read_start=d->profile?av_gettime_relative():0;
             ret = av_read_frame(d->input,d->packet);
+            if (d->profile) d->read_us+=av_gettime_relative()-read_start;
         } while (ret >= 0 && d->packet->stream_index != d->stream);
         if (ret == AVERROR_EOF) { d->draining=1; ret=avcodec_send_packet(d->codec,NULL); }
         else if (ret >= 0) { ret=avcodec_send_packet(d->codec,d->packet); av_packet_unref(d->packet); }
@@ -186,10 +195,12 @@ int nkg_gpu_next(NkgDecoder *d, void **output, int *width, int *height, double *
     if(nkg_gpu_convert(d->gpu,d->frame,d->rotation,output,d->error,sizeof(d->error))<0) return -1;
     return 1;
 }
-int nkg_video_next(NkgDecoder *d, const uint8_t **pixels, int *width, int *height, double *pts) {
+int nkg_video_next(NkgDecoder *d, uint8_t *pixels, size_t bytes, int *width, int *height, double *pts) {
     int ret;
+    int64_t start=d->profile?av_gettime_relative():0;
     // Discard preroll before GPU readback and RGB conversion.
     do { ret=decode(d); if (ret<=0) return ret; *pts=frame_time(d); } while (*pts+0.000001 < d->target);
+    if (d->profile) { int64_t now=av_gettime_relative(); d->decode_us+=now-start; start=now; }
     AVFrame *frame=d->frame;
     if (d->hardware) {
         if (frame->format != AV_PIX_FMT_D3D11) return fail(d,AVERROR(EINVAL),"expected hardware frame");
@@ -199,8 +210,13 @@ int nkg_video_next(NkgDecoder *d, const uint8_t **pixels, int *width, int *heigh
     }
     int w=frame->width,h=frame->height;
     if (w<=0 || h<=0 || (int64_t)w*h*4 > 256*1024*1024) return fail(d,AVERROR(EINVAL),"frame dimensions");
-    av_fast_malloc(&d->buffer,&d->capacity,(size_t)w*h*4);
-    if (!d->buffer) return fail(d,AVERROR(ENOMEM),"RGBA buffer");
+    if (!pixels || bytes<(size_t)w*h*4) return fail(d,AVERROR(EINVAL),"RGBA output buffer too small");
+    uint8_t *output=pixels;
+    if (d->rotation==90 || d->rotation==180 || d->rotation==270) {
+        av_fast_malloc(&d->buffer,&d->capacity,(size_t)w*h*4);
+        if (!d->buffer) return fail(d,AVERROR(ENOMEM),"rotation buffer");
+        output=d->buffer;
+    }
     if (!d->scale || d->scale_width!=w || d->scale_height!=h || d->scale_format!=frame->format) {
         sws_freeContext(d->scale);
         d->scale=sws_alloc_context();
@@ -221,22 +237,20 @@ int nkg_video_next(NkgDecoder *d, const uint8_t **pixels, int *width, int *heigh
         if ((ret=sws_setColorspaceDetails(d->scale,coeff,d->frame->color_range==AVCOL_RANGE_JPEG,coeff,1,0,1<<16,1<<16))<0) return fail(d,ret,"color metadata");
         d->color_space=d->frame->colorspace; d->color_range=d->frame->color_range;
     }
-    uint8_t *dst[4]={d->buffer,NULL,NULL,NULL}; int stride[4]={w*4,0,0,0};
+    uint8_t *dst[4]={output,NULL,NULL,NULL}; int stride[4]={w*4,0,0,0};
     if ((ret=sws_scale(d->scale,(const uint8_t *const *)frame->data,frame->linesize,0,h,dst,stride))<0) return fail(d,ret,"RGBA conversion");
-    *width=w; *height=h; *pixels=d->buffer;
+    *width=w; *height=h;
     if (d->rotation==90 || d->rotation==180 || d->rotation==270) {
-        av_fast_malloc(&d->rotated,&d->rotated_capacity,(size_t)w*h*4);
-        if (!d->rotated) return fail(d,AVERROR(ENOMEM),"rotation buffer");
         if (d->rotation!=180) { *width=h; *height=w; }
         for (int y=0;y<h;y++) for (int x=0;x<w;x++) {
             int dx,dy;
             if (d->rotation==90) { dx=y; dy=w-1-x; }
             else if (d->rotation==270) { dx=h-1-y; dy=x; }
             else { dx=w-1-x; dy=h-1-y; }
-            memcpy(d->rotated+((size_t)dy*(*width)+dx)*4,d->buffer+((size_t)y*w+x)*4,4);
+            memcpy(pixels+((size_t)dy*(*width)+dx)*4,output+((size_t)y*w+x)*4,4);
         }
-        *pixels=d->rotated;
     }
+    if (d->profile) d->convert_us+=av_gettime_relative()-start;
     return 1;
 }
 int nkg_audio_next(NkgDecoder *d, const float **samples, int *count, double *pts) {

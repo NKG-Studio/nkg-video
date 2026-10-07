@@ -200,10 +200,7 @@ impl Player {
             raw: None,
             next: None,
             texture: None,
-            gpu_display: cc
-                .wgpu_render_state
-                .clone()
-                .map(|state| crate::gpu::Display { state, id: None }),
+            gpu_display: cc.wgpu_render_state.clone().map(crate::gpu::Display::new),
             prepared: Arc::new(egui::ColorImage {
                 size: [0, 0],
                 pixels: Vec::new(),
@@ -422,9 +419,16 @@ impl Player {
     }
     fn display(&mut self, frame: Frame, ctx: &egui::Context) {
         if let Some(media) = &self.media {
-            if let Some(gpu) = &frame.gpu {
-                if let Some(display) = &mut self.gpu_display {
-                    if let Err(e) = display.show(gpu, media.width, media.height) {
+            if let Some(display) = &mut self.gpu_display {
+                let result = if let Some(gpu) = &frame.gpu {
+                    Some(display.show(gpu, media.width, media.height))
+                } else if media.alpha {
+                    Some(display.show_rgba(&frame.rgba, media.width, media.height))
+                } else {
+                    None
+                };
+                if let Some(result) = result {
+                    if let Err(e) = result {
                         self.error = e;
                         self.playing = false;
                         self.clock.pause();

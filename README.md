@@ -98,3 +98,59 @@ cargo test --release gpu_decode_and_import -- --ignored --nocapture
 回退缓存未命中时，前驱搜索从约两个标称帧间隔开始；若找不到真实前驱则逐次扩大搜索范围。平均帧率只决定初始搜索窗口，最终仍按真实 PTS 选择上一帧，避免对高码率/未压缩视频固定扫描一整秒。`cold_reverse` 可通过 `NKG_BENCH_VIDEO` 测量未命中缓存的回退与 CPU 图像准备，不包含纹理上传和屏幕呈现。
 
 本机 `FXUI_PopupAccessoriesPreview_02.avi`（3304×1440 BGRA rawvideo、30 fps、约 1.14 GB）：20 次冷回退中位数从 290 ms 降到 48 ms，本次最大 58 ms；50 ms 按键间隔、预取缓存已准备的 30 次回退取帧最大约 5 ms。未压缩视频仍需从文件读取大帧，不适用压缩编码的 D3D11VA 硬解路径。
+
+### GPU 资源复用（2026-10-07）
+
+参考 [VLC 的 `assert_ProcessorInput`](https://github.com/videolan/vlc/blob/master/modules/video_output/win32/direct3d11.cpp) 按解码纹理的 array slice 缓存输入视图；固定的 VideoProcessor 参数仅在尺寸或旋转变化时设置，颜色参数变化时单独更新。参考 [mpv 的跨 API 表面队列](https://github.com/mpv-player/mpv/blob/master/video/out/d3d11/hwdec_dxva2dxgi.c) 的空闲检测思路，为现有 D3D11→D3D12 链路实现共享输出资源池，没有引入播放器依赖。
+
+复用条件是原始帧的所有 Rust 引用已释放、wgpu 已提交的读取已完成，并且 D3D11 转换 fence 已完成。显示和历史缓存仍持有的帧不会被覆盖；尺寸或旋转变化后使用新池。每个池额外保留最多 3 个空闲输出表面，且像素数据不超过 64 MiB（不含驱动对齐），它们不计入上面的帧缓存预算；GPU 未完成的资源另计。没有空闲表面时分配新表面，不在 CPU 上等待 GPU。
+
+后续 Shader 调用 `gpu::Frame::texture` 时必须使用对应设备的同一 wgpu 队列，并持有该帧直到使用它的命令提交完成；不能只留下纹理克隆而提前释放帧。现有 UI 由 `Player::raw` 保持引用。资源回收回调只持有原生资源，不捕获 wgpu 对象，避免退出时的引用环。
+
+本机 RTX 5080，合成 H.264 1920×1080 / 60 fps，Release 下每轮处理 300 帧。改动前后交替运行各 5 次，解码、转换、egui 离屏渲染并等待 GPU 完成的中位数：**359.90 ms → 178.14 ms**，对应 **833.6 → 1684.1 fps**，耗时约降低 50.5%。不包含窗口呈现、显示器刷新，也不代表所有素材或其他显卡都有相同收益。透明视频与 CPU 兼容路径不使用此资源池。
+
+复现素材和优化后检查：
+
+```powershell
+./tools/ffmpeg/bin/ffmpeg.exe -hide_banner -loglevel error -f lavfi -i "testsrc2=size=1920x1080:rate=60:duration=6" -an -c:v libx264 -preset ultrafast -crf 20 -y test-media/gpu-1080p60.mp4
+$env:NKG_BENCH_VIDEO = "test-media/gpu-1080p60.mp4"
+cargo test --release gpu_decode_and_import -- --ignored --nocapture
+```
+
+该检查报告共享输出资源创建数，并验证首帧、定位与回退后的 GPU/CPU 画面对比、完成帧的实际复用、解码器关闭后保留帧不变，以及后台解码线程与渲染队列并发回收。性能计时段不回读。另已验证 HEVC、AV1、VP9、VFR 与 90° 旋转素材；原有透明视频、音频和定位回归继续保留。
+
+### 未压缩透明 AVI 的热点与优化（2026-10-07）
+
+使用 `FXUI_PopupAccessoriesPreview_02.avi` 实测：3304×1440、BGRA rawvideo、30 fps、60 帧、约 1.14 GB。该素材软件解码，硬解表面池不参与。顺序分阶段检查的三轮中位数（60 帧，阶段串行，不能与并行播放耗时直接相加）：
+
+| 原路径阶段 | 耗时 | 本次处理 |
+|---|---:|---|
+| 读取、解包及解码 | 511.6 ms | 继续由 FFmpeg 负责；进一步计时确认大部分在 `av_read_frame` |
+| 原生颜色转换 | 143.3 ms | 保留 FFmpeg 的格式、步长和旋转处理，直接写入 Rust 独占缓冲 |
+| Rust 帧准备（包含整帧拷贝） | 104.3 ms | 取消中间整帧拷贝；改后约 30.3 ms |
+| CPU Alpha 预乘与 UI 图像准备 | 383.0 ms | 正常透明视频显示改走 GPU Alpha 处理 |
+
+参考 [mpv GPU 渲染中的纹理上传和 Alpha 处理](https://github.com/mpv-player/mpv/blob/master/video/out/gpu/video.c)，透明 RGBA 帧直接上传到复用的纹理，再由一个 Shader 在线性光下预乘 Alpha，输出 sRGB 纹理给现有 egui 渲染。预乘规则对齐 [egui 0.31.1 的 Color32](https://github.com/emilk/egui/blob/0.31.1/crates/ecolor/src/color32.rs)，保持透明像素和半透明边缘；原始 RGBA 缓存不变。固定尺寸时复用上传纹理、输出纹理、绑定及管线，额外两张纹理的像素数据约 36.3 MiB（不含上传暂存及驱动开销）。FFmpeg 写入调用方提供的输出平面，沿用其 [sws_scale 示例](https://www.ffmpeg.org/doxygen/trunk/scale_video_8c-example.html) 的缓冲使用方式；只有没有其他引用的淘汰帧缓冲才可复用。
+
+RTX 5080、Release、同一素材，旧版 CPU Alpha 路径与新版 GPU Alpha 路径交替各运行五轮。首帧初始化后计时 59 帧，包含后台解码、纹理上传、egui 离屏绘制和等待 GPU 完成，不包含窗口呈现、控件/棋盘格绘制或显示器刷新：
+
+| 指标（五轮中位数） | 改前 | 改后 |
+|---|---:|---:|
+| 总处理耗时 | 896.70 ms | 709.51 ms |
+| 处理吞吐 | 65.8 fps | 83.2 fps |
+| UI 线程准备与上传的 CPU 提交耗时 | 588.46 ms | 153.99 ms |
+
+总处理耗时降低约 20.9%，吞吐提高约 26.4%。各阶段可重叠，CPU 提交耗时不等于 GPU 执行时间。文件系统缓存与系统负载会影响结果，不代表冷盘读取或窗口帧率。改后 `av_read_frame` 三轮中位数约 473.6 ms / 60 帧，仍是主要热点；其中包含读取、解包及包内存准备，尚未分离纯磁盘耗时。
+
+```powershell
+$env:NKG_BENCH_VIDEO = "E:/Work/Video_Res/UITest/popupacceddsories/FXUI_PopupAccessoriesPreview_02.avi"
+cargo test --release software_stage_profile -- --ignored --nocapture
+cargo test --release software_upload_and_render -- --ignored --nocapture
+cargo test --release software_rgba_matches_ffmpeg -- --ignored --nocapture
+# 仅用于同版本对照 CPU Alpha 显示路径；不恢复旧版解码器的整帧拷贝
+$env:NKG_BENCH_CPU_ALPHA = "1"
+cargo test --release software_upload_and_render -- --ignored --nocapture
+Remove-Item Env:NKG_BENCH_CPU_ALPHA
+```
+
+GPU 检查覆盖全部 256 个 Alpha 值与颜色梯度，和 egui CPU 参考的通道差不超过 1/255；读取失败及不合法缓冲会报错。该 AVI 的全部 60 帧原始 RGBA 与 FFmpeg 命令行逐字节一致。分阶段计时只在显式运行 profile 检查时开启；正常播放不读取这些计时器。`software_stage_profile` 故意保留 CPU 图像准备作为参考测量，新版透明视频 UI 不走这一步。
