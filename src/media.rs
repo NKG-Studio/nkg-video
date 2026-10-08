@@ -683,10 +683,17 @@ impl Clock {
             self.since = Some(Instant::now());
         }
     }
-    pub fn set(&mut self, position: f64) {
-        self.position = position;
-        if self.since.is_some() {
-            self.since = Some(Instant::now());
+    pub fn sync(&mut self, position: f64, now: Instant) {
+        if let Some(since) = self.since {
+            let elapsed = now.duration_since(since).as_secs_f64();
+            let current = self.position + elapsed;
+            // Audio consumption arrives in blocks. Slew at 90–110% instead of
+            // snapping the UI to each block; stop extrapolating on underrun.
+            let correction = (position - current).clamp(-elapsed * 0.1, elapsed * 0.1);
+            self.position = (current + correction)
+                .min(position + 0.05)
+                .max(self.position);
+            self.since = Some(now);
         }
     }
 }
@@ -694,6 +701,31 @@ impl Clock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn continuous_clock_between_audio_blocks() {
+        let start = Instant::now();
+        let mut clock = Clock::new(0.0);
+        clock.since = Some(start);
+        let mut previous = 0.0;
+        for tick in 1..=100 {
+            let elapsed = tick as f64 * 0.01;
+            let audio = (tick / 4) as f64 * 0.04;
+            clock.sync(audio, start + Duration::from_millis(tick * 10));
+            assert!(clock.position > previous, "must advance between audio blocks");
+            assert!((clock.position - elapsed).abs() < 0.05);
+            previous = clock.position;
+        }
+        // A stalled audio source must not let the UI run away or move backward.
+        for tick in 101..=200 {
+            clock.sync(1.0, start + Duration::from_millis(tick * 10));
+            assert!(clock.position >= previous);
+            assert!(clock.position <= 1.05);
+            previous = clock.position;
+        }
+        let mut paused = Clock::new(1.0 / 30.0);
+        paused.sync(2.0, start);
+        assert_eq!(paused.position(), 1.0 / 30.0);
+    }
     #[test]
     #[ignore = "playback decode + UI image throughput; optional NKG_BENCH_VIDEO"]
     fn playback_throughput() {

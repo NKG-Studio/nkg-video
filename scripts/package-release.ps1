@@ -9,6 +9,14 @@ $name = "nkg-video-$Version-windows-x64"
 $stage = Join-Path $root "artifacts/$name"
 if (Test-Path -LiteralPath $stage) { throw "Output already exists: $stage" }
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
+$aiRoot = Join-Path $root 'tools/mediapipe'
+if (!(Test-Path -LiteralPath (Join-Path $aiRoot 'mediapipe.dll'))) { throw 'Run scripts/setup-ai.ps1 before packaging AI features' }
+$aiStage = Join-Path $stage 'ai'
+New-Item -ItemType Directory -Path $aiStage | Out-Null
+foreach ($file in @('mediapipe.dll','LICENSE','NOTICE')) {
+    Copy-Item -LiteralPath (Join-Path $aiRoot $file) -Destination $aiStage
+}
+Copy-Item -LiteralPath (Join-Path $aiRoot 'models') -Destination $aiStage -Recurse
 $sdk = Join-Path $root 'tools/ffmpeg-shared'
 Copy-Item -LiteralPath 'target/release/nkg-video.exe' -Destination $stage
 Copy-Item -LiteralPath (Join-Path $sdk 'bin/ffprobe.exe') -Destination $stage

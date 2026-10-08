@@ -1,4 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod ai;
+mod ai_gpu;
 mod gpu;
 mod media;
 mod native;
@@ -11,6 +13,8 @@ fn main() -> eframe::Result {
         "NKG Video",
         eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
+                .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png"))
+                    .expect("embedded application icon"))
                 .with_decorations(false)
                 .with_inner_size([1280.0, 800.0])
                 .with_min_inner_size([800.0, 520.0]),
@@ -21,6 +25,6 @@ fn main() -> eframe::Result {
             },
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(ui::Player::new(cc)))),
+        Box::new(|cc| Ok(Box::new(ui::App::new(cc)))),
     )
 }

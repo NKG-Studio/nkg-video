@@ -131,11 +131,49 @@ impl Drop for Frame {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Filters {
+    pub exposure: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub sepia: f32,
+    pub invert: bool,
+    pub vignette: f32,
+}
+impl Default for Filters {
+    fn default() -> Self {
+        Self {
+            exposure: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            sepia: 0.0,
+            invert: false,
+            vignette: 0.0,
+        }
+    }
+}
+impl Filters {
+    fn uniform(self) -> [f32; 8] {
+        [
+            self.exposure.exp2(),
+            self.contrast,
+            self.saturation,
+            self.sepia,
+            u32::from(self.invert) as f32,
+            self.vignette,
+            u32::from(self != Self::default()) as f32,
+            0.0,
+        ]
+    }
+}
+
 struct VideoPass {
     output: wgpu::Texture,
     view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
     beauty: bool,
+    parameters: wgpu::Buffer,
+    filters: std::cell::Cell<Filters>,
 }
 impl VideoPass {
     fn new(device: &wgpu::Device, width: u32, height: u32, beauty: bool) -> Self {
@@ -186,26 +224,54 @@ impl VideoPass {
             multiview: None,
             cache: None,
         });
+        use wgpu::util::DeviceExt;
+        let parameters = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Video filter parameters"),
+            contents: bytemuck::cast_slice(&Filters::default().uniform()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         Self {
             output,
             view,
             pipeline,
             beauty,
+            parameters,
+            filters: std::cell::Cell::new(Filters::default()),
         }
     }
     fn bind(&self, device: &wgpu::Device, input: &wgpu::Texture) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Video processing input"),
             layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(
-                    &input.create_view(&Default::default()),
-                ),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &input.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.parameters.as_entire_binding(),
+                },
+            ],
         })
     }
-    fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue, bind: &wgpu::BindGroup) {
+    fn render(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bind: &wgpu::BindGroup,
+        filters: Filters,
+    ) {
+        if self.filters.get() != filters {
+            queue.write_buffer(
+                &self.parameters,
+                0,
+                bytemuck::cast_slice(&filters.uniform()),
+            );
+            self.filters.set(filters);
+        }
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -248,7 +314,11 @@ impl SoftwareUpload {
         let bind = pass.bind(device, &input);
         Self { input, bind, pass }
     }
-    fn upload(&self, device: &wgpu::Device, queue: &wgpu::Queue, rgba: &[u8]) {
+    fn upload(&self, device: &wgpu::Device, queue: &wgpu::Queue, rgba: &[u8], filters: Filters) {
+        self.write(queue, rgba);
+        self.pass.render(device, queue, &self.bind, filters);
+    }
+    fn write(&self, queue: &wgpu::Queue, rgba: &[u8]) {
         queue.write_texture(
             self.input.as_image_copy(),
             rgba,
@@ -259,7 +329,6 @@ impl SoftwareUpload {
             },
             self.input.size(),
         );
-        self.pass.render(device, queue, &self.bind);
     }
 }
 
@@ -269,6 +338,9 @@ pub struct Display {
     software: Option<SoftwareUpload>,
     beauty_pass: Option<VideoPass>,
     pub beauty: bool,
+    pub filters: Filters,
+    pub ai: crate::ai_gpu::Processor,
+    context: egui::Context,
 }
 impl Display {
     pub fn new(state: RenderState) -> Self {
@@ -278,9 +350,13 @@ impl Display {
             software: None,
             beauty_pass: None,
             beauty: false,
+            filters: Filters::default(),
+            ai: Default::default(),
+            context: Default::default(),
         }
     }
     pub fn show_rgba(&mut self, rgba: &[u8], width: usize, height: usize) -> Result<(), String> {
+        let beauty = self.beauty && !self.ai.settings.enabled;
         let limit = self.state.device.limits().max_texture_dimension_2d as usize;
         if width == 0
             || height == 0
@@ -293,17 +369,32 @@ impl Display {
         if self.software.as_ref().is_none_or(|s| {
             s.input.width() != width as u32
                 || s.input.height() != height as u32
-                || s.pass.beauty != self.beauty
+                || s.pass.beauty != beauty
         }) {
             self.software = Some(SoftwareUpload::new(
                 &self.state.device,
                 width as u32,
                 height as u32,
-                self.beauty,
+                beauty,
             ));
         }
         let upload = self.software.as_ref().unwrap();
-        upload.upload(&self.state.device, &self.state.queue, rgba);
+        if self.ai.settings.flags() != 0 {
+            upload.write(&self.state.queue, rgba);
+            let input = self.ai.apply(
+                &self.state.device,
+                &self.state.queue,
+                &upload.input,
+                &self.context,
+            );
+            let bind = upload.pass.bind(&self.state.device, &input);
+            upload
+                .pass
+                .render(&self.state.device, &self.state.queue, &bind, self.filters);
+        } else {
+            self.ai.clear();
+            upload.upload(&self.state.device, &self.state.queue, rgba, self.filters);
+        }
         let view = upload.pass.output.create_view(&Default::default());
         self.show_view(&view);
         Ok(())
@@ -315,28 +406,51 @@ impl Display {
             width as u32,
             height as u32,
         )?;
-        let view = if self.beauty {
+        let processed = if self.ai.settings.flags() != 0 {
+            Some(self.ai.apply(
+                &self.state.device,
+                &self.state.queue,
+                texture,
+                &self.context,
+            ))
+        } else {
+            self.ai.clear();
+            None
+        };
+        let texture = processed.as_ref().unwrap_or(texture);
+        let beauty = self.beauty && !self.ai.settings.enabled;
+        let view = if self.effects_enabled() {
             if self
                 .beauty_pass
                 .as_ref()
-                .is_none_or(|p| p.output.size() != texture.size())
+                .is_none_or(|p| p.output.size() != texture.size() || p.beauty != beauty)
             {
                 self.beauty_pass = Some(VideoPass::new(
                     &self.state.device,
                     width as u32,
                     height as u32,
-                    true,
+                    beauty,
                 ));
             }
             let pass = self.beauty_pass.as_ref().unwrap();
             let bind = pass.bind(&self.state.device, texture);
-            pass.render(&self.state.device, &self.state.queue, &bind);
+            pass.render(&self.state.device, &self.state.queue, &bind, self.filters);
             pass.output.create_view(&Default::default())
         } else {
             texture.create_view(&Default::default())
         };
         self.show_view(&view);
         Ok(())
+    }
+    pub fn effects_enabled(&self) -> bool {
+        self.beauty || self.filters != Filters::default() || self.ai.settings.flags() != 0
+    }
+    pub fn begin_frame(&mut self, pts: f64, ctx: &egui::Context) {
+        self.ai.pts = pts;
+        self.context = ctx.clone();
+    }
+    pub fn poll_ai(&mut self) -> bool {
+        self.ai.poll(&self.state.device, &self.state.queue)
     }
     fn show_view(&mut self, view: &wgpu::TextureView) {
         let mut renderer = self.state.renderer.write();
@@ -361,6 +475,7 @@ impl Display {
         }
         self.software = None;
         self.beauty_pass = None;
+        self.ai.clear();
     }
 }
 impl Drop for Display {
@@ -680,8 +795,34 @@ mod tests {
             bgra.size(),
         );
         let pass = VideoPass::new(&device, 16, 16, true);
-        pass.render(&device, &queue, &pass.bind(&device, &bgra));
+        pass.render(
+            &device,
+            &queue,
+            &pass.bind(&device, &bgra),
+            Filters::default(),
+        );
         assert_eq!(beauty, read_rgba(&device, &queue, &pass.output));
+        let output = display.software.as_ref().unwrap().pass.output.clone();
+        display.filters = Filters {
+            exposure: 0.4,
+            contrast: 1.1,
+            saturation: 0.7,
+            sepia: 0.3,
+            invert: true,
+            vignette: 0.5,
+        };
+        display.show_rgba(&pixels, 16, 16).unwrap();
+        assert_eq!(
+            output,
+            display.software.as_ref().unwrap().pass.output,
+            "filter adjustments must reuse the output texture"
+        );
+        pass.render(&device, &queue, &pass.bind(&device, &bgra), display.filters);
+        assert_eq!(
+            read_rgba(&device, &queue, &output),
+            read_rgba(&device, &queue, &pass.output)
+        );
+        display.filters = Filters::default();
         display.beauty = false;
         display.show_rgba(&pixels, 16, 16).unwrap();
         assert_eq!(display.id, id);
@@ -728,6 +869,172 @@ mod tests {
             display.beauty,
             "selection should survive opening another video"
         );
+    }
+
+    #[test]
+    #[ignore = "requires DX12 hardware; validates filters and measures 1080p processing"]
+    fn filters_pixels_and_performance() {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        }))
+        .unwrap();
+        println!("Adapter: {:?}", adapter.get_info());
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+                .unwrap();
+        let base = Filters::default();
+        let pixels: Vec<u8> = (0..=255u8).flat_map(|a| [100, 140, 180, a]).collect();
+        let upload = SoftwareUpload::new(&device, 256, 1, false);
+        // Independent expected encoded RGB, before linear-light alpha premultiplication.
+        for (filters, expected) in [
+            (base, [100, 140, 180]),
+            (
+                Filters {
+                    saturation: 0.0,
+                    ..base
+                },
+                [134, 134, 134],
+            ),
+            (Filters { sepia: 1.0, ..base }, [159, 133, 106]),
+            (
+                Filters {
+                    invert: true,
+                    ..base
+                },
+                [155, 115, 75],
+            ),
+            (
+                Filters {
+                    exposure: 1.0,
+                    ..base
+                },
+                [200, 255, 255],
+            ),
+            (
+                Filters {
+                    exposure: -1.0,
+                    ..base
+                },
+                [50, 70, 90],
+            ),
+            (
+                Filters {
+                    contrast: 0.0,
+                    ..base
+                },
+                [128, 128, 128],
+            ),
+            (
+                Filters {
+                    contrast: 2.0,
+                    ..base
+                },
+                [73, 153, 233],
+            ),
+            (
+                Filters {
+                    saturation: 0.0,
+                    invert: true,
+                    ..base
+                },
+                [121, 121, 121],
+            ),
+            (base, [100, 140, 180]),
+        ] {
+            upload.upload(&device, &queue, &pixels, filters);
+            let actual = read_rgba(&device, &queue, &upload.pass.output);
+            for (a, p) in actual.chunks_exact(4).enumerate() {
+                let expected = egui::Color32::from_rgba_unmultiplied(
+                    expected[0],
+                    expected[1],
+                    expected[2],
+                    a as u8,
+                )
+                .to_array();
+                assert_eq!(p[3], a as u8);
+                for c in 0..3 {
+                    assert!(
+                        p[c].abs_diff(expected[c]) <= 2,
+                        "{filters:?}: alpha={a}, {p:?} != {expected:?}"
+                    );
+                }
+            }
+            assert_eq!(&actual[..4], &[0, 0, 0, 0]);
+        }
+        let upload = SoftwareUpload::new(&device, 16, 16, false);
+        let pixels = [100, 140, 180, 255].repeat(256);
+        upload.upload(
+            &device,
+            &queue,
+            &pixels,
+            Filters {
+                vignette: 1.0,
+                ..base
+            },
+        );
+        let actual = read_rgba(&device, &queue, &upload.pass.output);
+        assert_eq!(
+            &actual[(8 * 16 + 8) * 4..(8 * 16 + 8) * 4 + 4],
+            &[100, 140, 180, 255]
+        );
+        assert!(
+            actual[0] < 30 && actual[3] == 255,
+            "corners should darken without changing alpha"
+        );
+
+        // Every effect still applies after beauty, including its non-skin early exit.
+        let beauty = SoftwareUpload::new(&device, 16, 16, true);
+        beauty.upload(
+            &device,
+            &queue,
+            &pixels,
+            Filters {
+                saturation: 0.0,
+                ..base
+            },
+        );
+        let gray = read_rgba(&device, &queue, &beauty.pass.output);
+        assert!(gray.chunks_exact(4).all(|p| p[0] == p[1] && p[1] == p[2]));
+
+        // Resident texture, reused bind/pipeline/output, no upload or readback in timing.
+        let upload = SoftwareUpload::new(&device, 1920, 1080, false);
+        upload.upload(
+            &device,
+            &queue,
+            &[100, 140, 180, 255].repeat(1920 * 1080),
+            base,
+        );
+        let all = Filters {
+            exposure: 0.3,
+            contrast: 1.2,
+            saturation: 0.8,
+            sepia: 0.4,
+            invert: true,
+            vignette: 0.5,
+        };
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..5 {
+            for index in [round % 2, 1 - round % 2] {
+                let filters = [base, all][index];
+                upload.pass.render(&device, &queue, &upload.bind, filters);
+                device.poll(wgpu::Maintain::Wait);
+                let start = std::time::Instant::now();
+                for _ in 0..120 {
+                    upload.pass.render(&device, &queue, &upload.bind, filters);
+                }
+                device.poll(wgpu::Maintain::Wait);
+                times[index].push(start.elapsed().as_secs_f64() * 1000.0 / 120.0);
+            }
+        }
+        for (name, mut times) in ["alpha only", "all color filters"].into_iter().zip(times) {
+            times.sort_by(f64::total_cmp);
+            println!("1080p {name}: median {:.3} ms/frame (5 x 120; CPU submission + GPU completion; excludes decode/upload/presentation)", times[2]);
+        }
     }
 
     #[test]

@@ -109,7 +109,10 @@ fn load_media(
     }
     unreachable!()
 }
-pub struct Player {
+struct Player {
+    id: u64,
+    path: Option<PathBuf>,
+    open_request: Option<PathBuf>,
     media: Option<Media>,
     video: Option<Video>,
     raw: Option<Frame>,
@@ -119,7 +122,7 @@ pub struct Player {
     prepared: Arc<egui::ColorImage>,
     audio: Option<Audio>,
     sink: Option<Sink>,
-    output: Option<(OutputStream, OutputStreamHandle)>,
+    output: Option<OutputStreamHandle>,
     clock: Clock,
     audio_start: f64,
     playing: bool,
@@ -135,7 +138,6 @@ pub struct Player {
     volume: f32,
     muted: bool,
     checker: bool,
-    fullscreen: bool,
     seek_value: f64,
     seeking: bool,
     seek_pending: bool,
@@ -150,57 +152,22 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_theme(egui::Theme::Dark);
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.visuals = egui::Visuals::dark();
-        style.visuals.panel_fill = PANEL;
-        style.visuals.window_fill = PANEL;
-        style.visuals.window_corner_radius = 0.into();
-        style.visuals.selection.bg_fill = ACCENT;
-        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(45, 45, 48);
-        style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(45, 45, 48);
-        style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
-        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(62, 62, 66);
-        style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(62, 62, 66);
-        style.visuals.widgets.noninteractive.bg_stroke =
-            Stroke::new(1.0_f32, Color32::from_gray(48));
-        for v in [
-            &mut style.visuals.widgets.noninteractive,
-            &mut style.visuals.widgets.inactive,
-            &mut style.visuals.widgets.hovered,
-            &mut style.visuals.widgets.active,
-            &mut style.visuals.widgets.open,
-        ] {
-            v.corner_radius = 0.into();
-        }
-        style.spacing.button_padding = Vec2::new(12.0, 7.0);
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        style.spacing.slider_rail_height = 3.0;
-        style.visuals.slider_trailing_fill = true;
-        cc.egui_ctx.set_style(style);
-        // Use an installed font for Chinese filenames; do not ship system font files.
-        if let Ok(bytes) = fs::read("C:/Windows/Fonts/msyh.ttc") {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("cjk".into(), egui::FontData::from_owned(bytes).into());
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .push("cjk".into());
-            cc.egui_ctx.set_fonts(fonts);
-        }
-        let output = OutputStream::try_default().ok();
+    fn new(
+        id: u64,
+        state: Option<eframe::egui_wgpu::RenderState>,
+        output: Option<OutputStreamHandle>,
+    ) -> Self {
         let directory = std::env::current_dir().unwrap_or_default();
-        let mut app = Self {
+        Self {
+            id,
+            path: None,
+            open_request: None,
             media: None,
             video: None,
             raw: None,
             next: None,
             texture: None,
-            gpu_display: cc.wgpu_render_state.clone().map(crate::gpu::Display::new),
+            gpu_display: state.map(crate::gpu::Display::new),
             prepared: Arc::new(egui::ColorImage {
                 size: [0, 0],
                 pixels: Vec::new(),
@@ -223,7 +190,6 @@ impl Player {
             volume: 0.8,
             muted: false,
             checker: true,
-            fullscreen: false,
             seek_value: 0.0,
             seeking: false,
             seek_pending: false,
@@ -235,11 +201,7 @@ impl Player {
             browser_error: String::new(),
             recent: vec![],
             dropped: 0,
-        };
-        if let Some(path) = std::env::args_os().nth(1) {
-            app.open(PathBuf::from(path), 0.0, true, cc.egui_ctx.clone());
         }
-        app
     }
     fn pause_audio(&mut self) {
         if let Some(sink) = self.sink.take() {
@@ -251,6 +213,7 @@ impl Player {
         self.audio = None;
     }
     fn open(&mut self, path: PathBuf, position: f64, resume: bool, ctx: egui::Context) {
+        self.path = Some(path.clone());
         self.stop_audio();
         self.video = None;
         self.next = None;
@@ -346,6 +309,9 @@ impl Player {
         self.playing = false;
         self.resume = resume && !at_end;
         self.seek_pending = true;
+        if let Some(display) = &mut self.gpu_display {
+            display.ai.invalidate();
+        }
         self.seek_value = position;
         self.seeking = false;
         self.error.clear();
@@ -358,7 +324,7 @@ impl Player {
         let Some(source) = audio.source.take() else {
             return;
         };
-        let Some((_, handle)) = &self.output else {
+        let Some(handle) = &self.output else {
             self.warning = "No audio output device; playing video only".into();
             self.audio = None;
             return;
@@ -412,7 +378,7 @@ impl Player {
     }
     fn timeline_position(&self) -> f64 {
         timeline_time(
-            self.position(),
+            self.clock.position(),
             self.media.as_ref().map_or(0.0, |m| m.duration),
             self.eof && self.next.is_none() && !self.seek_pending && self.error.is_empty(),
         )
@@ -420,9 +386,10 @@ impl Player {
     fn display(&mut self, frame: Frame, ctx: &egui::Context) {
         if let Some(media) = &self.media {
             if let Some(display) = &mut self.gpu_display {
+                display.begin_frame(frame.pts, ctx);
                 let result = if let Some(gpu) = &frame.gpu {
                     Some(display.show(gpu, media.width, media.height))
-                } else if media.alpha || display.beauty {
+                } else if media.alpha || display.effects_enabled() {
                     Some(display.show_rgba(&frame.rgba, media.width, media.height))
                 } else {
                     // A disabled filter must not leave its last output on screen.
@@ -460,6 +427,11 @@ impl Player {
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        let refresh_ai = self
+            .gpu_display
+            .as_mut()
+            .is_some_and(|display| display.poll_ai());
+        let previous_pts = self.raw.as_ref().map(|f| f.pts);
         if let Some(error) = self
             .audio
             .as_ref()
@@ -475,10 +447,6 @@ impl Player {
                     self.mode = loaded.mode;
                     self.warning = loaded.warning;
                     self.audio_start = self.clock.position();
-                    if !self.recent.contains(&loaded.media.path) {
-                        self.recent.insert(0, loaded.media.path.clone());
-                        self.recent.truncate(12);
-                    }
                     self.media = Some(loaded.media);
                     self.video = Some(loaded.video);
                     self.display(loaded.first, ctx);
@@ -531,7 +499,7 @@ impl Player {
         }
         if self.playing {
             let position = self.position();
-            self.clock.set(position);
+            self.clock.sync(position, std::time::Instant::now());
         }
         if self.playing || self.step {
             let position = self.position();
@@ -615,6 +583,15 @@ impl Player {
                 video.prefetch(frame.pts);
             }
         }
+        if refresh_ai
+            && !self.seek_pending
+            && self.pending.is_none()
+            && self.raw.as_ref().map(|f| f.pts) == previous_pts
+        {
+            if let Some(frame) = self.raw.take() {
+                self.display(frame, ctx);
+            }
+        }
         if self.playing {
             // Let the presentation/vsync loop pace playback. A 5 ms deferred
             // repaint can miss the next refresh and turn 60 fps into uneven 30/60.
@@ -623,6 +600,10 @@ impl Player {
             || self.seek_pending
             || self.step
             || (self.video.is_some() && self.next.is_none() && !self.eof)
+            || self
+                .gpu_display
+                .as_ref()
+                .is_some_and(|display| display.ai.pending())
         {
             ctx.request_repaint_after(Duration::from_millis(5));
         }
@@ -648,17 +629,31 @@ impl Player {
             Err(e) => self.browser_error = e.to_string(),
         }
     }
-    fn titlebar(&mut self, ctx: &egui::Context) {
+    fn titlebar(ctx: &egui::Context) {
         egui::TopBottomPanel::top("title")
             .exact_height(30.0)
             .frame(egui::Frame::new().fill(BG))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    let (_, drag) = ui.allocate_exact_size(
+                    let (drag_rect, drag) = ui.allocate_exact_size(
                         Vec2::new((ui.available_width() - 108.0).max(0.0), 30.0),
                         egui::Sense::click_and_drag(),
                     );
+                    let logo_id = egui::Id::new("app_logo");
+                    let logo = ctx.data(|d| d.get_temp::<egui::TextureHandle>(logo_id))
+                        .unwrap_or_else(|| {
+                            let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png"))
+                                .expect("embedded application icon");
+                            let image = egui::ColorImage::from_rgba_unmultiplied(
+                                [icon.width as usize, icon.height as usize], &icon.rgba);
+                            let texture = ctx.load_texture("app_logo", image, egui::TextureOptions::LINEAR);
+                            ctx.data_mut(|d| d.insert_temp(logo_id, texture.clone()));
+                            texture
+                        });
+                    ui.painter().image(logo.id(), egui::Rect::from_center_size(
+                        egui::pos2(drag_rect.right() - 17.0, drag_rect.center().y), Vec2::splat(26.0)),
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
                     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                     if drag.drag_started() {
                         ctx.send_viewport_cmd(ViewportCommand::StartDrag);
@@ -678,15 +673,18 @@ impl Player {
                 });
             });
     }
-    fn controls(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("transport")
-            .exact_height(76.0)
+    fn controls(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        let ctx = &ui.ctx().clone();
+        egui::TopBottomPanel::bottom(egui::Id::new(("transport", self.id)))
+            .exact_height(72.0)
             .frame(
                 egui::Frame::new()
                     .fill(BG)
-                    .inner_margin(egui::Margin::symmetric(20, 8)),
+                    .inner_margin(egui::Margin::symmetric(8, 6)),
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
+                let compact = ui.available_width() < 330.0;
+                ui.spacing_mut().item_spacing.x = 5.0;
                 let duration = self.media.as_ref().map_or(0.0, |m| m.duration);
                 let mut position = if self.seeking {
                     self.seek_value
@@ -738,26 +736,43 @@ impl Player {
                             }
                         },
                     );
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!("{}  /  {}", time(self.timeline_position()), time(duration)))
-                            .size(12.0)
-                            .color(MUTED),
-                    );
-                    if let Some(m) = &self.media {
-                        let pts = self.raw.as_ref().map_or(0.0, |f| f.pts);
-                        ui.label(RichText::new(format!("·  {}", frame_label(pts, m.fps, m.frame_count))).size(12.0).color(MUTED))
-                            .on_hover_text(format!("当前帧号 / 末帧号，均从 0 开始。{}\n当前帧号仍按显示帧时间戳和平均帧率估算，可变帧率或非零视频起点可能有偏差。总帧数采用文件标注；未标注时不猜测末帧号。", m.frame_count.map_or_else(|| "总帧数未知。".into(), |n| format!("共 {n} 帧。"))));
-                    }
+                    let right_width = if compact { 77.0 } else { 146.0 };
+                    let status_width = (ui.available_width() - right_width - 5.0).max(1.0);
+                    ui.allocate_ui_with_layout(Vec2::new(status_width, 30.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt(("status", self.id))
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = Vec2::splat(5.0);
+                                    status_badge(ui, Color32::from_rgb(80, 170, 240), "clock", "视频时间",
+                                        if compact { time(self.timeline_position()) } else { format!("{} / {}", time(self.timeline_position()), time(duration)) })
+                                        .on_hover_text(format!("播放时间 / 总时长：{} / {}", time(self.timeline_position()), time(duration)));
+                                    if let Some(m) = &self.media {
+                                        let pts = self.raw.as_ref().map_or(0.0, |f| f.pts);
+                                        status_badge(ui, Color32::from_rgb(80, 200, 145), "film", "视频帧数", frame_label(pts, m.fps, m.frame_count).trim_start_matches("视频帧数 ").into())
+                                            .on_hover_text(format!("当前帧号 / 末帧号，均从 0 开始。{}\n当前帧号仍按显示帧时间戳和平均帧率估算，可变帧率或非零视频起点可能有偏差。总帧数采用文件标注；未标注时不猜测末帧号。", m.frame_count.map_or_else(|| "总帧数未知。".into(), |n| format!("共 {n} 帧。"))));
+                                    }
+                                    let stats = ctx.data(|d| d.get_temp::<FrameStats>(egui::Id::new("frame_stats"))).unwrap_or_default();
+                                    status_badge(ui, Color32::from_rgb(235, 180, 80), "timer", "播放器帧时间",
+                                        stats.display.map_or_else(|| "-- ms".into(), |(ms, _, _)| format!("{ms:.2} ms")))
+                                        .on_hover_text(stats.display.map_or_else(|| "等待帧时间统计".into(), |(ms, _, cpu_ms)| format!(
+                                            "播放器帧时间：{ms:.2} ms\nCPU 更新与渲染提交：{cpu_ms:.2} ms\nGPU 执行耗时：未单独采集\n帧时间为相邻界面帧的实际间隔，包含垂直同步、限帧及空闲等待；不是 CPU 与 GPU 耗时之和，也不是屏幕呈现延迟。每秒显示一次平均值。")));
+                                    status_badge(ui, Color32::from_rgb(185, 140, 245), "monitor", "播放器帧率",
+                                        stats.display.map_or_else(|| "-- FPS".into(), |(_, fps, _)| format!("{fps:.1} FPS")))
+                                        .on_hover_text("最近一秒的软件界面实际刷新频率，每秒更新；不是视频素材帧率，暂停时按需刷新。");
+                                });
+                            });
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon(ui, "fullscreen", "全屏 · F11").clicked() {
-                            self.fullscreen = !self.fullscreen;
-                            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
+                            toggle_fullscreen(ctx);
                         }
-                        ui.add_space(12.0);
-                        ui.spacing_mut().slider_width = 64.0;
-                        ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false))
-                            .on_hover_text("音量");
+                        if !compact {
+                            ui.spacing_mut().slider_width = 64.0;
+                            ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false))
+                                .on_hover_text("音量");
+                        }
                         if icon(
                             ui,
                             if self.muted { "muted" } else { "volume" },
@@ -772,7 +787,7 @@ impl Player {
                 if let Some(sink) = &self.sink {
                     sink.set_volume(if self.muted { 0.0 } else { self.volume });
                 }
-            });
+            }).response
     }
     fn context_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.set_min_width(200.0);
@@ -794,7 +809,7 @@ impl Player {
                 }
             });
             if let Some(path) = selected {
-                self.open(path, 0.0, true, ctx.clone());
+                self.open_request = Some(path);
                 ui.close_menu();
             }
         }
@@ -818,11 +833,66 @@ impl Player {
         );
         ui.checkbox(&mut self.checker, "透明棋盘格背景");
         if let Some(display) = &mut self.gpu_display {
-            if ui
-                .checkbox(&mut display.beauty, "美颜（磨皮 / 美白）")
-                .on_hover_text("轻度磨皮和美白，按肤色估计处理范围")
-                .changed()
-            {
+            let mut changed = ui
+                .add_enabled(
+                    !display.ai.settings.enabled,
+                    egui::Checkbox::new(&mut display.beauty, "美颜（磨皮 / 美白）"),
+                )
+                .on_hover_text("按肤色估计处理范围；启用 AI 后改用 AI 菜单中的皮肤磨皮 / 美白设置")
+                .changed();
+            ui.menu_button("视频滤镜", |ui| {
+                let filters = &mut display.filters;
+                let before = *filters;
+                ui.horizontal(|ui| {
+                    if ui.button("重置").clicked() {
+                        *filters = Default::default();
+                    }
+                    if ui.button("黑白").clicked() {
+                        *filters = crate::gpu::Filters {
+                            saturation: 0.0,
+                            ..Default::default()
+                        };
+                    }
+                    if ui.button("复古").clicked() {
+                        *filters = crate::gpu::Filters {
+                            sepia: 1.0,
+                            ..Default::default()
+                        };
+                    }
+                });
+                ui.add(egui::Slider::new(&mut filters.exposure, -2.0..=2.0).text("曝光 EV"));
+                ui.add(egui::Slider::new(&mut filters.contrast, 0.0..=2.0).text("对比度"));
+                ui.add(egui::Slider::new(&mut filters.saturation, 0.0..=2.0).text("饱和度"));
+                ui.add(egui::Slider::new(&mut filters.sepia, 0.0..=1.0).text("复古"));
+                ui.add(egui::Slider::new(&mut filters.vignette, 0.0..=1.0).text("暗角"));
+                ui.checkbox(&mut filters.invert, "反色");
+                changed |= *filters != before;
+            });
+            ui.menu_button("AI 美颜 / 美型 / 美体", |ui| {
+                let settings = &mut display.ai.settings;
+                let before = *settings;
+                ui.checkbox(&mut settings.enabled, "启用 AI 人像美化");
+                ui.add_enabled_ui(settings.enabled, |ui| {
+                    ui.add(egui::Slider::new(&mut settings.slim_face, 0.0..=1.0).text("瘦脸"));
+                    ui.add(egui::Slider::new(&mut settings.eyes, 0.0..=1.0).text("大眼"));
+                    ui.add(egui::Slider::new(&mut settings.chin, -1.0..=1.0).text("下巴"));
+                    ui.add(egui::Slider::new(&mut settings.smooth, 0.0..=1.0).text("皮肤磨皮"));
+                    ui.add(egui::Slider::new(&mut settings.white, 0.0..=1.0).text("皮肤美白"));
+                    ui.separator();
+                    ui.add(egui::Slider::new(&mut settings.waist, 0.0..=1.0).text("瘦腰"));
+                    ui.add(egui::Slider::new(&mut settings.slim_legs, 0.0..=1.0).text("瘦腿"));
+                    ui.add(egui::Slider::new(&mut settings.long_legs, 0.0..=1.0).text("长腿"));
+                });
+                ui.label("单人模式；身体关键点清晰可见时生效");
+                if !display.ai.status.is_empty() {
+                    ui.label(&display.ai.status);
+                }
+                if ui.button("恢复默认").clicked() {
+                    *settings = Default::default();
+                }
+                changed |= *settings != before;
+            });
+            if changed {
                 if let Some(frame) = self.raw.take() {
                     self.display(frame, ctx);
                 }
@@ -830,15 +900,14 @@ impl Player {
             }
         }
         if ui
-            .button(if self.fullscreen {
+            .button(if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
                 "退出全屏                    F11"
             } else {
                 "全屏                            F11"
             })
             .clicked()
         {
-            self.fullscreen = !self.fullscreen;
-            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
+            toggle_fullscreen(ctx);
             ui.close_menu();
         }
         ui.separator();
@@ -852,88 +921,92 @@ impl Player {
             return;
         }
         let mut close = false;
-        let response = egui::Modal::new(egui::Id::new("video_information")).show(ctx, |ui| {
-            ui.set_width(520.0_f32.min(ctx.screen_rect().width() - 48.0));
-            ui.horizontal(|ui| {
-                ui.heading("视频信息");
+        let response =
+            egui::Modal::new(egui::Id::new(("video_information", self.id))).show(ctx, |ui| {
+                ui.set_width(520.0_f32.min(ctx.screen_rect().width() - 48.0));
+                ui.horizontal(|ui| {
+                    ui.heading("视频信息");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close = icon(ui, "close", "关闭视频信息").clicked();
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height((ctx.screen_rect().height() - 180.0).max(100.0))
+                    .show(ui, |ui| {
+                        let value_width = (ui.available_width() - 134.0).max(80.0);
+                        egui::Grid::new("media_details")
+                            .num_columns(2)
+                            .spacing([24.0, 9.0])
+                            .show(ui, |ui| {
+                                let mut row = |label: &str, value: String| {
+                                    ui.add_sized(
+                                        [110.0, 18.0],
+                                        egui::Label::new(RichText::new(label).color(MUTED))
+                                            .wrap()
+                                            .halign(egui::Align::Min),
+                                    );
+                                    ui.add_sized(
+                                        [value_width, 18.0],
+                                        egui::Label::new(value)
+                                            .wrap()
+                                            .halign(egui::Align::Min)
+                                            .selectable(true),
+                                    );
+                                    ui.end_row();
+                                };
+                                if let Some(m) = &self.media {
+                                    row(
+                                        "文件",
+                                        m.path
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .into_owned(),
+                                    );
+                                    row("路径", display_path(&m.path));
+                                    row("时长", time(m.duration));
+                                    row("播放进度时间", time(self.timeline_position()));
+                                    if let Some(frame) = &self.raw {
+                                        row(
+                                            "当前帧 PTS（相对起点）",
+                                            format!("{:.6} s", frame.pts),
+                                        );
+                                    }
+                                    row("分辨率", format!("{} × {}", m.width, m.height));
+                                    row("帧率", format!("{:.3} fps", m.fps));
+                                    row(
+                                        "总帧数",
+                                        m.frame_count.map_or_else(
+                                            || "未知（文件未标注）".into(),
+                                            |n| n.to_string(),
+                                        ),
+                                    );
+                                    row("视频编码", m.codec.to_uppercase());
+                                    row("像素格式", m.pixel_format.clone());
+                                    row("透明通道", if m.alpha { "有" } else { "无" }.into());
+                                    for (label, value) in &m.details {
+                                        row(label, value.clone());
+                                    }
+                                }
+                                row("解码方式", self.mode.clone());
+                                row("播放跳帧", self.dropped.to_string());
+                            });
+                        if !self.warning.is_empty() {
+                            ui.separator();
+                            ui.label(&self.warning);
+                        }
+                        if !self.error.is_empty() {
+                            ui.separator();
+                            ui.colored_label(Color32::LIGHT_RED, &self.error);
+                        }
+                    });
+                ui.separator();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    close = icon(ui, "close", "关闭视频信息").clicked();
+                    close |= ui.button("关闭").clicked();
                 });
             });
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .max_height((ctx.screen_rect().height() - 180.0).max(100.0))
-                .show(ui, |ui| {
-                    let value_width = (ui.available_width() - 134.0).max(80.0);
-                    egui::Grid::new("media_details")
-                        .num_columns(2)
-                        .spacing([24.0, 9.0])
-                        .show(ui, |ui| {
-                            let mut row = |label: &str, value: String| {
-                                ui.add_sized(
-                                    [110.0, 18.0],
-                                    egui::Label::new(RichText::new(label).color(MUTED))
-                                        .wrap()
-                                        .halign(egui::Align::Min),
-                                );
-                                ui.add_sized(
-                                    [value_width, 18.0],
-                                    egui::Label::new(value)
-                                        .wrap()
-                                        .halign(egui::Align::Min)
-                                        .selectable(true),
-                                );
-                                ui.end_row();
-                            };
-                            if let Some(m) = &self.media {
-                                row(
-                                    "文件",
-                                    m.path
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .into_owned(),
-                                );
-                                row("路径", display_path(&m.path));
-                                row("时长", time(m.duration));
-                                row("播放进度时间", time(self.timeline_position()));
-                                if let Some(frame) = &self.raw {
-                                    row("当前帧 PTS（相对起点）", format!("{:.6} s", frame.pts));
-                                }
-                                row("分辨率", format!("{} × {}", m.width, m.height));
-                                row("帧率", format!("{:.3} fps", m.fps));
-                                row(
-                                    "总帧数",
-                                    m.frame_count.map_or_else(
-                                        || "未知（文件未标注）".into(),
-                                        |n| n.to_string(),
-                                    ),
-                                );
-                                row("视频编码", m.codec.to_uppercase());
-                                row("像素格式", m.pixel_format.clone());
-                                row("透明通道", if m.alpha { "有" } else { "无" }.into());
-                                for (label, value) in &m.details {
-                                    row(label, value.clone());
-                                }
-                            }
-                            row("解码方式", self.mode.clone());
-                            row("播放跳帧", self.dropped.to_string());
-                        });
-                    if !self.warning.is_empty() {
-                        ui.separator();
-                        ui.label(&self.warning);
-                    }
-                    if !self.error.is_empty() {
-                        ui.separator();
-                        ui.colored_label(Color32::LIGHT_RED, &self.error);
-                    }
-                });
-            ui.separator();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                close |= ui.button("关闭").clicked();
-            });
-        });
         if close || response.should_close() {
             self.information = false;
         }
@@ -953,7 +1026,8 @@ impl Player {
         let mut open = true;
         let mut selected = None;
         let mut directory = None;
-        egui::Window::new("Open video")
+        egui::Window::new("打开视频（新标签）")
+            .id(egui::Id::new(("browser", self.id)))
             .open(&mut open)
             .default_size([700.0, 450.0])
             .collapsible(false)
@@ -1023,9 +1097,55 @@ impl Player {
         }
         if let Some(path) = selected {
             self.browser = false;
-            self.open(path, 0.0, true, ctx.clone());
+            self.open_request = Some(path);
         }
     }
+}
+
+fn status_badge(ui: &mut egui::Ui, color: Color32, kind: &str, label: &str, text: String) -> egui::Response {
+    let galley = ui.fonts(|fonts| {
+        fonts.layout_no_wrap(text.clone(), egui::FontId::proportional(12.0), color)
+    });
+    // Use the same 30-point slot as transport buttons; paint everything about its center.
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(galley.size().x + 35.0, 30.0), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{label} {text}")));
+    let painter = ui.painter();
+    painter.rect_stroke(rect.shrink2(Vec2::new(0.0, 3.0)), 3.0, Stroke::new(1.0_f32, color), egui::StrokeKind::Inside);
+    painter.galley(egui::pos2(rect.left() + 28.0, rect.center().y - galley.size().y / 2.0), galley, color);
+    // Lucide 0.468.0 SVG geometry, rendered natively at 16 x 16 (assets/lucide).
+    let origin = egui::pos2(rect.left() + 7.0, rect.center().y - 8.0);
+    let point = |x: f32, y: f32| origin + Vec2::new(x, y) * (16.0 / 24.0);
+    let stroke = Stroke::new(4.0_f32 / 3.0, color);
+    let line = |a: (f32, f32), b: (f32, f32)| { painter.line_segment([point(a.0, a.1), point(b.0, b.1)], stroke); };
+    match kind {
+        "clock" => {
+            painter.circle_stroke(point(12.0, 12.0), 20.0 / 3.0, stroke);
+            line((12.0, 6.0), (12.0, 12.0));
+            line((12.0, 12.0), (16.0, 14.0));
+        }
+        "film" => {
+            painter.rect_stroke(egui::Rect::from_min_max(point(3.0, 3.0), point(21.0, 21.0)), 1.0, stroke, egui::StrokeKind::Middle);
+            line((7.0, 3.0), (7.0, 21.0));
+            line((17.0, 3.0), (17.0, 21.0));
+            line((3.0, 12.0), (21.0, 12.0));
+            for y in [7.5, 16.5] {
+                line((3.0, y), (7.0, y));
+                line((17.0, y), (21.0, y));
+            }
+        }
+        "timer" => {
+            line((10.0, 2.0), (14.0, 2.0));
+            line((12.0, 14.0), (15.0, 11.0));
+            painter.circle_stroke(point(12.0, 14.0), 16.0 / 3.0, stroke);
+        }
+        "monitor" => {
+            painter.rect_stroke(egui::Rect::from_min_max(point(2.0, 3.0), point(22.0, 17.0)), 1.0, stroke, egui::StrokeKind::Middle);
+            line((8.0, 21.0), (16.0, 21.0));
+            line((12.0, 17.0), (12.0, 21.0));
+        }
+        _ => {}
+    }
+    response.on_hover_text(label)
 }
 
 fn icon(ui: &mut egui::Ui, kind: &str, label: &str) -> egui::Response {
@@ -1143,8 +1263,8 @@ fn frame_label(pts: f64, fps: f64, total: Option<u64>) -> String {
     // ponytail: PTS-based index is approximate for VFR; an exact global index needs a frame timestamp index.
     let current = (pts.max(0.0) * fps).round() as u64;
     total.and_then(|n| n.checked_sub(1)).map_or_else(
-        || format!("帧 {current}"),
-        |last| format!("帧 {current} / {last}"),
+        || format!("视频帧数 {current}"),
+        |last| format!("视频帧数 {current} / {last}"),
     )
 }
 fn timeline_time(position: f64, duration: f64, ended: bool) -> f64 {
@@ -1170,148 +1290,501 @@ fn time(seconds: f64) -> String {
     )
 }
 
-impl eframe::App for Player {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        self.poll(ctx);
-        if !self.information {
-            if let Some(path) =
-                ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()))
-            {
-                self.open(path, 0.0, true, ctx.clone());
+pub struct App {
+    dock: egui_dock::DockState<Player>,
+    active: u64,
+    next_id: u64,
+    close_requests: Vec<u64>,
+    render_state: Option<eframe::egui_wgpu::RenderState>,
+    // Keep the shared output stream alive until all player sinks have been dropped.
+    output: Option<(OutputStream, OutputStreamHandle)>,
+    recent: Vec<PathBuf>,
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
+        let mut style = (*cc.egui_ctx.style()).clone();
+        style.visuals = egui::Visuals::dark();
+        style.visuals.panel_fill = PANEL;
+        style.visuals.window_fill = PANEL;
+        style.visuals.window_corner_radius = 0.into();
+        style.visuals.selection.bg_fill = ACCENT;
+        style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(45, 45, 48);
+        style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(45, 45, 48);
+        style.visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(62, 62, 66);
+        style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(62, 62, 66);
+        style.visuals.widgets.noninteractive.bg_stroke =
+            Stroke::new(1.0_f32, Color32::from_gray(48));
+        for v in [
+            &mut style.visuals.widgets.noninteractive,
+            &mut style.visuals.widgets.inactive,
+            &mut style.visuals.widgets.hovered,
+            &mut style.visuals.widgets.active,
+            &mut style.visuals.widgets.open,
+        ] {
+            v.corner_radius = 0.into();
+        }
+        style.spacing.button_padding = Vec2::new(12.0, 7.0);
+        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+        style.spacing.slider_rail_height = 3.0;
+        style.visuals.slider_trailing_fill = true;
+        cc.egui_ctx.set_style(style);
+        // Use one font for Chinese and digits so their baselines and metrics agree.
+        // Load the installed font without redistributing it.
+        if let Ok(bytes) = fs::read("C:/Windows/Fonts/msyh.ttc") {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("cjk".into(), egui::FontData::from_owned(bytes).into());
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "cjk".into());
+            cc.egui_ctx.set_fonts(fonts);
+        }
+        let output = OutputStream::try_default().ok();
+        let state = cc.wgpu_render_state.clone();
+        let player = Player::new(0, state.clone(), output.as_ref().map(|(_, h)| h.clone()));
+        let mut app = Self {
+            dock: egui_dock::DockState::new(vec![player]),
+            active: 0,
+            next_id: 1,
+            close_requests: Vec::new(),
+            render_state: state,
+            output,
+            recent: Vec::new(),
+        };
+        for path in std::env::args_os().skip(1) {
+            app.open(PathBuf::from(path), &cc.egui_ctx);
+        }
+        app
+    }
+
+    fn active_player(&mut self) -> Option<&mut Player> {
+        self.dock
+            .iter_all_tabs_mut()
+            .map(|(_, p)| p)
+            .find(|p| p.id == self.active)
+    }
+
+    fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.recent.retain(|p| p != &path);
+        self.recent.insert(0, path.clone());
+        self.recent.truncate(12);
+        // An empty starter tab is reusable; opening a file never replaces a video.
+        let empty = self
+            .dock
+            .iter_all_tabs()
+            .find(|(_, p)| p.path.is_none())
+            .map(|(_, p)| p.id);
+        if let Some(id) = empty {
+            let player = self
+                .dock
+                .iter_all_tabs_mut()
+                .find(|(_, p)| p.id == id)
+                .unwrap()
+                .1;
+            self.active = player.id;
+            player.open(path, 0.0, true, ctx.clone());
+        } else {
+            let mut player = Player::new(
+                self.next_id,
+                self.render_state.clone(),
+                self.output.as_ref().map(|(_, h)| h.clone()),
+            );
+            self.next_id += 1;
+            self.active = player.id;
+            player.open(path, 0.0, true, ctx.clone());
+            self.dock.push_to_focused_leaf(player);
+        }
+        for (_, player) in self.dock.iter_all_tabs_mut() {
+            player.recent.clone_from(&self.recent);
+        }
+        let location = self
+            .dock
+            .iter_all_tabs()
+            .find(|(_, p)| p.id == self.active)
+            .and_then(|((surface, node), _)| {
+                self.dock[surface][node]
+                    .iter_tabs()
+                    .position(|p| p.id == self.active)
+                    .map(|index| (surface, node, egui_dock::TabIndex(index)))
+            });
+        if let Some((surface, node, tab)) = location {
+            self.dock.set_active_tab((surface, node, tab));
+            self.dock.set_focused_node_and_surface((surface, node));
+        }
+        ctx.request_repaint();
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.stop_audio();
+    }
+}
+
+fn toggle_fullscreen(ctx: &egui::Context) {
+    let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
+}
+
+fn fullscreen_controls_visible(ctx: &egui::Context, fullscreen: bool, interacting: bool) -> bool {
+    let id = egui::Id::new("fullscreen_controls_until");
+    if !fullscreen {
+        ctx.data_mut(|d| d.remove::<f64>(id));
+        return true;
+    }
+    let (now, active) = ctx.input(|i| (i.time,
+        i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_))) || i.pointer.any_down()));
+    let until = ctx.data_mut(|d| {
+        if active || interacting { d.insert_temp(id, now + 2.0); }
+        d.get_temp::<f64>(id).unwrap_or(now)
+    });
+    if now < until {
+        ctx.request_repaint_after(Duration::from_secs_f64(until - now));
+        true
+    } else {
+        false
+    }
+}
+
+impl Player {
+    fn canvas(&mut self, ui: &mut egui::Ui, selected: bool) -> egui::Response {
+        let ctx = &ui.ctx().clone();
+        let rect = ui.available_rect_before_wrap();
+        let canvas = ui.interact(rect, ui.id().with("canvas"), egui::Sense::click());
+        canvas.context_menu(|ui| self.context_menu(ui, ctx));
+        let texture_id = self
+            .gpu_display
+            .as_ref()
+            .and_then(|d| d.id)
+            .or_else(|| self.texture.as_ref().map(|t| t.id()));
+        if let (Some(texture_id), Some(media)) = (texture_id, &self.media) {
+            let height = rect.height().min(rect.width() / media.aspect);
+            let image_rect = egui::Rect::from_center_size(
+                rect.center(),
+                Vec2::new(height * media.aspect, height),
+            );
+            if self.checker && media.alpha {
+                let tile = 18.0;
+                for y in 0..(image_rect.height() / tile).ceil() as usize {
+                    for x in 0..(image_rect.width() / tile).ceil() as usize {
+                        let r = egui::Rect::from_min_size(
+                            image_rect.min + Vec2::new(x as f32 * tile, y as f32 * tile),
+                            Vec2::splat(tile),
+                        )
+                        .intersect(image_rect);
+                        ui.painter().rect_filled(
+                            r,
+                            0.0,
+                            if (x + y) % 2 == 0 {
+                                Color32::from_gray(45)
+                            } else {
+                                Color32::from_gray(65)
+                            },
+                        );
+                    }
+                }
+            } else {
+                ui.painter().rect_filled(image_rect, 0.0, Color32::BLACK);
+            }
+            ui.painter().image(
+                texture_id,
+                image_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(egui::Rect::from_center_size(
+                    rect.center(),
+                    Vec2::new(320.0, 80.0),
+                )),
+                |ui| {
+                    ui.vertical_centered(|ui| {
+                        if self.pending.is_some() {
+                            ui.spinner();
+                        } else if !self.error.is_empty() {
+                            ui.label(RichText::new("无法播放此视频").color(Color32::LIGHT_RED))
+                                .on_hover_text(&self.error);
+                            if ui.button("打开其他视频").clicked() {
+                                self.browse();
+                            }
+                        } else {
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("打开视频").size(16.0))
+                                        .frame(false),
+                                )
+                                .clicked()
+                            {
+                                self.browse();
+                            }
+                            ui.label(RichText::new("或将文件拖到这里").size(12.0).color(MUTED));
+                        }
+                    });
+                },
+            );
+        }
+        if texture_id.is_some() && !self.error.is_empty() {
+            ui.painter().text(
+                rect.center_top() + Vec2::new(0.0, 20.0),
+                egui::Align2::CENTER_TOP,
+                "播放已停止 · 右键查看详情",
+                egui::FontId::proportional(13.0),
+                Color32::LIGHT_RED,
+            );
+        }
+        if canvas.double_clicked() {
+            toggle_fullscreen(ctx);
+        } else if canvas.clicked() && selected && self.media.is_some() {
+            self.toggle(ctx);
+        }
+        canvas
+    }
+}
+
+struct Viewer<'a> {
+    active: &'a mut u64,
+    close_requests: &'a mut Vec<u64>,
+}
+impl egui_dock::TabViewer for Viewer<'_> {
+    type Tab = Player;
+    fn title(&mut self, tab: &mut Player) -> egui::WidgetText {
+        tab.path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map_or_else(|| "打开视频".into(), |n| n.to_string_lossy().into_owned())
+            .into()
+    }
+    fn id(&mut self, tab: &mut Player) -> egui::Id {
+        egui::Id::new(("player", tab.id))
+    }
+    fn on_tab_button(&mut self, tab: &mut Player, response: &egui::Response) {
+        if response.clicked() || response.drag_started() {
+            *self.active = tab.id;
+        }
+    }
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Player) {
+        let selected = *self.active == tab.id;
+        let pane_rect = ui.max_rect();
+        let controls = tab.controls(ui);
+        if controls.contains_pointer() && ui.input(|i| i.pointer.any_pressed()) {
+            *self.active = tab.id;
+        }
+        let response = tab.canvas(ui, selected);
+        if response.clicked() || response.secondary_clicked() {
+            *self.active = tab.id;
+        }
+        if *self.active == tab.id {
+            ui.painter().rect_stroke(
+                pane_rect,
+                0.0,
+                Stroke::new(1.0_f32, ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    fn on_close(&mut self, tab: &mut Player) -> bool {
+        // This frame may already reference the tab's GPU texture. Drop next frame.
+        self.close_requests.push(tab.id);
+        false
+    }
+    fn scroll_bars(&self, _: &Player) -> [bool; 2] {
+        [false, false]
+    }
+    fn allowed_in_windows(&self, _: &mut Player) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Default)]
+struct FrameStats {
+    elapsed: f64,
+    frames: u64,
+    cpu_seconds: f64,
+    // Frame interval (ms), application FPS, CPU time (ms), from the same window.
+    display: Option<(f64, f64, f64)>,
+}
+
+impl FrameStats {
+    fn record(&mut self, dt: f32, cpu_seconds: f32) {
+        if !dt.is_finite() || dt <= 0.0 || !cpu_seconds.is_finite() || cpu_seconds < 0.0 {
+            return;
+        }
+        self.elapsed += f64::from(dt);
+        self.frames += 1;
+        self.cpu_seconds += f64::from(cpu_seconds);
+        if self.elapsed >= 1.0 {
+            self.display = Some((
+                self.elapsed * 1000.0 / self.frames as f64,
+                self.frames as f64 / self.elapsed,
+                self.cpu_seconds * 1000.0 / self.frames as f64,
+            ));
+            self.elapsed = 0.0;
+            self.frames = 0;
+            self.cpu_seconds = 0.0;
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(seconds) = frame.info().cpu_usage {
+            let dt = ctx.input(|i| i.unstable_dt);
+            ctx.data_mut(|d| {
+                d.get_temp_mut_or_default::<FrameStats>(egui::Id::new("frame_stats"))
+                    .record(dt, seconds);
+            });
+        }
+        self.update_ui(ctx);
+    }
+}
+
+impl App {
+    fn update_ui(&mut self, ctx: &egui::Context) {
+        for id in self.close_requests.drain(..) {
+            let location = self
+                .dock
+                .iter_all_tabs()
+                .find(|(_, p)| p.id == id)
+                .and_then(|((surface, node), _)| {
+                    self.dock[surface][node]
+                        .iter_tabs()
+                        .position(|p| p.id == id)
+                        .map(|index| (surface, node, egui_dock::TabIndex(index)))
+                });
+            if let Some(location) = location {
+                self.dock.remove_tab(location);
             }
         }
-        if !ctx.wants_keyboard_input() && !self.browser && !self.information {
-            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-                self.toggle(ctx);
+        // Poll every tab, including tabs hidden behind another tab.
+        for (_, player) in self.dock.iter_all_tabs_mut() {
+            player.poll(ctx);
+        }
+        if self.active_player().is_none() {
+            self.active = self
+                .dock
+                .find_active_focused()
+                .map(|(_, p)| p.id)
+                .or_else(|| self.dock.iter_all_tabs().next().map(|(_, p)| p.id))
+                .unwrap_or(0);
+        }
+        let modal = self
+            .dock
+            .iter_all_tabs()
+            .any(|(_, p)| p.browser || p.information);
+        if !modal {
+            for file in ctx.input(|i| i.raw.dropped_files.clone()) {
+                if let Some(path) = file.path {
+                    self.open(path, ctx);
+                }
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-                self.next_frame();
+        }
+        let mut browse = false;
+        if !ctx.wants_keyboard_input() && !modal {
+            if let Some(player) = self.active_player() {
+                if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                    player.toggle(ctx);
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                    player.next_frame();
+                }
+                if ctx.input(|i| {
+                    i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::Backspace)
+                }) {
+                    player.previous_frame(ctx);
+                }
             }
-            if ctx.input(|i| {
-                i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::Backspace)
-            }) {
-                self.previous_frame(ctx);
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.ctrl) {
-                self.browse();
-            }
+            browse = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.ctrl);
             if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
-                self.fullscreen = !self.fullscreen;
-                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
+                toggle_fullscreen(ctx);
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.fullscreen = false;
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
             }
         }
-        if !self.fullscreen {
-            self.titlebar(ctx);
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        let show_controls = fullscreen_controls_visible(ctx, fullscreen,
+            modal || ctx.memory(|m| m.any_popup_open()));
+        ctx.send_viewport_cmd(ViewportCommand::CursorVisible(!fullscreen || show_controls));
+        if !fullscreen {
+            Player::titlebar(ctx);
         }
-        self.controls(ctx);
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(0))
+            .frame(egui::Frame::new().fill(if fullscreen { Color32::BLACK } else { BG }).inner_margin(0))
             .show(ctx, |ui| {
-                let rect = ui.available_rect_before_wrap();
-                let canvas = ui.interact(rect, ui.id().with("canvas"), egui::Sense::click());
-                canvas.context_menu(|ui| self.context_menu(ui, ctx));
-                let texture_id = self
-                    .gpu_display
-                    .as_ref()
-                    .and_then(|d| d.id)
-                    .or_else(|| self.texture.as_ref().map(|t| t.id()));
-                if let (Some(texture_id), Some(media)) = (texture_id, &self.media) {
-                    let height = rect.height().min(rect.width() / media.aspect);
-                    let image_rect = egui::Rect::from_center_size(
-                        rect.center(),
-                        Vec2::new(height * media.aspect, height),
-                    );
-                    if self.checker && media.alpha {
-                        let tile = 18.0;
-                        for y in 0..(image_rect.height() / tile).ceil() as usize {
-                            for x in 0..(image_rect.width() / tile).ceil() as usize {
-                                let r = egui::Rect::from_min_size(
-                                    image_rect.min + Vec2::new(x as f32 * tile, y as f32 * tile),
-                                    Vec2::splat(tile),
-                                )
-                                .intersect(image_rect);
-                                ui.painter().rect_filled(
-                                    r,
-                                    0.0,
-                                    if (x + y) % 2 == 0 {
-                                        Color32::from_gray(45)
-                                    } else {
-                                        Color32::from_gray(65)
-                                    },
-                                );
-                            }
-                        }
-                    } else {
-                        ui.painter().rect_filled(image_rect, 0.0, Color32::BLACK);
-                    }
-                    ui.painter().image(
-                        texture_id,
-                        image_rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-                } else {
-                    ui.scope_builder(
-                        egui::UiBuilder::new().max_rect(egui::Rect::from_center_size(
-                            rect.center(),
-                            Vec2::new(320.0, 80.0),
-                        )),
-                        |ui| {
-                            ui.vertical_centered(|ui| {
-                                if self.pending.is_some() {
-                                    ui.spinner();
-                                } else if !self.error.is_empty() {
-                                    ui.label(
-                                        RichText::new("无法播放此视频").color(Color32::LIGHT_RED),
-                                    )
-                                    .on_hover_text(&self.error);
-                                    if ui.button("打开其他视频").clicked() {
-                                        self.browse();
-                                    }
-                                } else {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(RichText::new("打开视频").size(16.0))
-                                                .frame(false),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.browse();
-                                    }
-                                    ui.label(
-                                        RichText::new("或将文件拖到这里").size(12.0).color(MUTED),
-                                    );
-                                }
+                if fullscreen && self.active_player().is_some() {
+                    let screen = ui.max_rect();
+                    let player = self.active_player().unwrap();
+                    // Fullscreen bypasses docking without changing the saved tab/split layout.
+                    player.canvas(ui, true);
+                    if show_controls {
+                        egui::Area::new(egui::Id::new(("fullscreen_controls", player.id)))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(egui::pos2(screen.left(), screen.bottom() - 72.0))
+                            .show(ctx, |ui| {
+                                ui.set_width(screen.width());
+                                ui.set_height(72.0);
+                                player.controls(ui);
                             });
-                        },
-                    );
-                }
-                if texture_id.is_some() && !self.error.is_empty() {
-                    ui.painter().text(
-                        rect.center_top() + Vec2::new(0.0, 20.0),
-                        egui::Align2::CENTER_TOP,
-                        "播放已停止 · 右键查看详情",
-                        egui::FontId::proportional(13.0),
-                        Color32::LIGHT_RED,
-                    );
-                }
-                if canvas.double_clicked() {
-                    self.fullscreen = !self.fullscreen;
-                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
-                } else if canvas.clicked() && self.media.is_some() {
-                    self.toggle(ctx);
+                    } else {
+                        ctx.set_cursor_icon(egui::CursorIcon::None);
+                    }
+                } else if self.dock.iter_all_tabs().next().is_none() {
+                    ui.centered_and_justified(|ui| {
+                        browse |= ui.button("打开视频或拖入多个文件").clicked();
+                    });
+                } else {
+                    egui_dock::DockArea::new(&mut self.dock)
+                        .show_leaf_close_all_buttons(false)
+                        .show_leaf_collapse_buttons(false)
+                        .style(egui_dock::Style::from_egui(ui.style()))
+                        .show_inside(
+                            ui,
+                            &mut Viewer {
+                                active: &mut self.active,
+                                close_requests: &mut self.close_requests,
+                            },
+                        );
                 }
             });
-        self.browser_ui(ctx);
-        self.information_ui(ctx);
-        if !self.information
-            && !self.fullscreen
-            && !ctx.input(|i| i.viewport().maximized.unwrap_or(false))
-        {
+        if !self.close_requests.is_empty() {
+            ctx.request_repaint();
+        }
+        if browse {
+            if self.active_player().is_none() {
+                let mut player = Player::new(
+                    self.next_id,
+                    self.render_state.clone(),
+                    self.output.as_ref().map(|(_, h)| h.clone()),
+                );
+                self.active = self.next_id;
+                self.next_id += 1;
+                player.recent.clone_from(&self.recent);
+                self.dock.push_to_first_leaf(player);
+            }
+            if let Some(player) = self.active_player() {
+                player.browse();
+            }
+        }
+        let mut requests = Vec::new();
+        for (_, player) in self.dock.iter_all_tabs_mut() {
+            player.browser_ui(ctx);
+            player.information_ui(ctx);
+            if let Some(path) = player.open_request.take() {
+                requests.push(path);
+            }
+        }
+        for path in requests {
+            self.open(path, ctx);
+        }
+        if !modal && !fullscreen && !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
                 let r = ctx.screen_rect();
                 let left = p.x < r.left() + 5.0;
@@ -1344,6 +1817,384 @@ impl eframe::App for Player {
 #[cfg(test)]
 mod playback_tests {
     use super::*;
+    #[test]
+    fn fullscreen_controls_hide_wake_and_preserve_layout() {
+        let ctx = egui::Context::default();
+        let mut app = dock_app();
+        let mut run = |time: f64, fullscreen: bool, events: Vec<egui::Event>| {
+            let mut input = egui::RawInput {
+                time: Some(time),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1280.0, 800.0))),
+                events,
+                ..Default::default()
+            };
+            input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().fullscreen = Some(fullscreen);
+            ctx.run(input, |ctx| app.update_ui(ctx))
+        };
+        let hidden = run(0.0, true, vec![]);
+        assert!(hidden.viewport_output[&egui::ViewportId::ROOT].commands.contains(&ViewportCommand::CursorVisible(false)));
+        assert!(egui::containers::panel::PanelState::load(&ctx, egui::Id::new(("transport", 0u64))).is_none());
+        let shown = run(0.1, true, vec![egui::Event::PointerMoved(egui::pos2(100.0, 100.0))]);
+        assert!(shown.viewport_output[&egui::ViewportId::ROOT].commands.contains(&ViewportCommand::CursorVisible(true)));
+        assert!(egui::containers::panel::PanelState::load(&ctx, egui::Id::new(("transport", 0u64))).is_some());
+        let hidden = run(2.2, true, vec![]);
+        assert!(hidden.viewport_output[&egui::ViewportId::ROOT].commands.contains(&ViewportCommand::CursorVisible(false)));
+        let shown = run(2.3, true, vec![egui::Event::PointerMoved(egui::pos2(200.0, 100.0))]);
+        assert!(shown.viewport_output[&egui::ViewportId::ROOT].commands.contains(&ViewportCommand::CursorVisible(true)));
+        run(3.0, false, vec![]);
+        assert!(ctx.data(|d| d.get_temp::<f64>(egui::Id::new("fullscreen_controls_until"))).is_none());
+        assert_eq!(app.dock.iter_all_tabs().count(), 1);
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn transport_icons_and_badges_share_centerline() {
+        fn collect(shape: &egui::Shape, buttons: &mut Vec<f32>, badges: &mut Vec<f32>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes { collect(shape, buttons, badges); }
+                }
+                egui::Shape::Path(path) if path.closed && path.points.len() == 3 => {
+                    buttons.push(egui::Rect::from_points(&path.points).center().y);
+                }
+                egui::Shape::Rect(rect) if rect.rect.height() == 24.0 => {
+                    badges.push(rect.rect.center().y);
+                }
+                _ => {}
+            }
+        }
+        for scale in [1.0, 1.5, 2.0] {
+            for width in [320.0, 1280.0] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(scale);
+                let mut player = Player::new(0, None, None);
+                let output = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 300.0))),
+                    ..Default::default()
+                }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| { player.controls(ui); });
+                });
+                let (mut buttons, mut badges) = (Vec::new(), Vec::new());
+                for shape in output.shapes { collect(&shape.shape, &mut buttons, &mut badges); }
+                assert_eq!(buttons.len(), 2);
+                assert!(!badges.is_empty());
+                for y in badges {
+                    assert!((y - buttons[0]).abs() <= 0.5, "width={width}, scale={scale}: badge {y}, button {}", buttons[0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frame_stats_publish_once_per_second() {
+        let mut stats = FrameStats::default();
+        for _ in 0..3 {
+            stats.record(0.25, 0.002);
+            assert!(stats.display.is_none());
+        }
+        stats.record(0.25, 0.006);
+        let (ms, fps, cpu_ms) = stats.display.unwrap();
+        assert_eq!(ms, 250.0);
+        assert_eq!(ms * fps, 1000.0);
+        assert!((cpu_ms - 3.0).abs() < 0.001);
+        assert_eq!(fps, 4.0);
+        let previous = stats.display;
+        stats.record(0.5, 0.010);
+        assert_eq!(stats.display, previous);
+        stats.record(0.5, 0.010);
+        let (ms, fps, cpu_ms) = stats.display.unwrap();
+        assert_eq!(ms, 500.0);
+        assert_eq!(ms * fps, 1000.0);
+        assert!((cpu_ms - 10.0).abs() < 0.001);
+        assert_eq!(fps, 2.0);
+        stats.record(0.0, 0.0);
+        stats.record(f32::NAN, 0.0);
+        assert_eq!(stats.frames, 0);
+    }
+
+    #[test]
+    fn status_badges_spacing_and_wrap() {
+        let ctx = egui::Context::default();
+        for width in [800.0, 260.0] {
+            let mut rects = Vec::new();
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(width, 300.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::splat(5.0);
+                            for text in [
+                                "00:00:07.833 / 00:00:07.833",
+                                "234 / 234",
+                                "1.25 ms",
+                                "60.0 FPS",
+                            ] {
+                                rects.push(status_badge(ui, ACCENT, "clock", "视频时间", text.into()).rect);
+                            }
+                        });
+                    });
+                },
+            );
+            for pair in rects.windows(2) {
+                assert!(!pair[0].intersects(pair[1]));
+                let gap = if (pair[0].top() - pair[1].top()).abs() < 0.1 {
+                    pair[1].left() - pair[0].right()
+                } else {
+                    pair[1].top() - pair[0].bottom()
+                };
+                assert!((gap - 5.0).abs() < 0.1, "badge gap: {gap}");
+            }
+            assert!(rects.iter().all(|r| r.right() <= width));
+            if width < 300.0 {
+                assert!(rects.last().unwrap().top() > rects[0].top());
+            }
+        }
+    }
+
+    fn dock_app() -> App {
+        App {
+            dock: egui_dock::DockState::new(vec![Player::new(0, None, None)]),
+            active: 0,
+            next_id: 1,
+            close_requests: Vec::new(),
+            render_state: None,
+            output: None,
+            recent: Vec::new(),
+        }
+    }
+
+    fn draw(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.update_ui(ctx),
+        );
+    }
+
+    #[test]
+    fn dock_batch_layout_ids_and_close() {
+        let ctx = egui::Context::default();
+        let mut app = dock_app();
+        draw(&mut app, &ctx, vec![]);
+        // Invalid media exercises independent loading/errors without test assets.
+        for _ in 0..4 {
+            app.open(PathBuf::from("Cargo.toml"), &ctx);
+        }
+        draw(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.dock
+                .iter_all_nodes()
+                .filter(|(_, n)| n.is_leaf())
+                .count(),
+            1
+        );
+        assert_eq!(app.dock.find_active_focused().unwrap().1.id, 3);
+        // Each tab fills the same region until explicitly split by the user.
+        for index in 0..4 {
+            app.dock.set_active_tab((
+                egui_dock::SurfaceIndex::main(),
+                egui_dock::NodeIndex(0),
+                egui_dock::TabIndex(index),
+            ));
+            draw(&mut app, &ctx, vec![]);
+        }
+        let tabs: Vec<_> = app
+            .dock
+            .iter_all_tabs()
+            .map(|((s, n), p)| (p.id, app.dock[s][n].rect().unwrap()))
+            .collect();
+        assert_eq!(tabs.len(), 4);
+        for (i, (id, rect)) in tabs.iter().enumerate() {
+            assert!(rect.width() > 300.0 && rect.height() > 200.0, "{rect:?}");
+            assert!(!tabs[..i].iter().any(|(other, _)| id == other));
+            let controls =
+                egui::containers::panel::PanelState::load(&ctx, egui::Id::new(("transport", *id)))
+                    .unwrap()
+                    .rect;
+            assert!(
+                rect.contains_rect(controls),
+                "each video's controls must stay in its own pane"
+            );
+            assert!(
+                (controls.height() - 72.0).abs() < 0.1,
+                "timeline and controls must be visible"
+            );
+        }
+        let surface = egui_dock::SurfaceIndex::main();
+        let root = egui_dock::NodeIndex(0);
+        let moved = app
+            .dock
+            .remove_tab((surface, root, egui_dock::TabIndex(3)))
+            .unwrap();
+        let [_, right] = app.dock.split(
+            (surface, root),
+            egui_dock::Split::Right,
+            0.5,
+            egui_dock::Node::leaf(moved),
+        );
+        app.open(PathBuf::from("Cargo.toml"), &ctx);
+        draw(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.dock
+                .iter_all_nodes()
+                .filter(|(_, n)| n.is_leaf())
+                .count(),
+            2
+        );
+        assert_eq!(
+            app.dock[surface][right].tabs_count(),
+            2,
+            "opening in a split adds a tab to that group"
+        );
+        let generations: Vec<_> = app
+            .dock
+            .iter_all_tabs()
+            .map(|(_, p)| (p.generation.clone(), p.generation.load(Ordering::Relaxed)))
+            .collect();
+        for (_, player) in app.dock.iter_all_tabs_mut() {
+            let mut viewer = Viewer {
+                active: &mut app.active,
+                close_requests: &mut app.close_requests,
+            };
+            assert!(!egui_dock::TabViewer::on_close(&mut viewer, player));
+        }
+        assert_eq!(app.dock.iter_all_tabs().count(), 5);
+        draw(&mut app, &ctx, vec![]);
+        assert_eq!(app.dock.iter_all_tabs().count(), 0);
+        for (generation, before) in generations {
+            assert!(generation.load(Ordering::Relaxed) > before);
+        }
+        draw(&mut app, &ctx, vec![]);
+        app.open(PathBuf::from("Cargo.toml"), &ctx);
+        draw(&mut app, &ctx, vec![]);
+        assert_eq!(app.dock.iter_all_tabs().count(), 1);
+        assert!(app.active_player().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires generated test-media/h264.mp4 and vp9-alpha.webm"]
+    fn real_dock_independent_playback() {
+        let ctx = egui::Context::default();
+        let mut app = dock_app();
+        draw(&mut app, &ctx, vec![]);
+        app.open(PathBuf::from("test-media/h264.mp4"), &ctx);
+        app.open(PathBuf::from("test-media/vp9-alpha.webm"), &ctx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while app
+            .dock
+            .iter_all_tabs()
+            .any(|(_, p)| p.raw.as_ref().is_none_or(|f| f.pts < 0.1))
+        {
+            draw(&mut app, &ctx, vec![]);
+            for (_, p) in app.dock.iter_all_tabs() {
+                assert!(p.error.is_empty(), "{}", p.error);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "both videos must advance"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let ids: Vec<_> = app
+            .dock
+            .iter_all_tabs()
+            .map(|(_, p)| p.texture.as_ref().unwrap().id())
+            .collect();
+        assert_ne!(ids[0], ids[1], "video textures must be independent");
+        // Space affects only the selected video.
+        draw(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(!app.active_player().unwrap().playing);
+        assert!(
+            app.dock
+                .iter_all_tabs()
+                .find(|(_, p)| p.id == 0)
+                .unwrap()
+                .1
+                .playing
+        );
+        let other_before = app
+            .dock
+            .iter_all_tabs()
+            .find(|(_, p)| p.id == 0)
+            .unwrap()
+            .1
+            .raw
+            .as_ref()
+            .unwrap()
+            .pts;
+        app.active_player().unwrap().seek(0.8, false, &ctx);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.active_player().unwrap().seek_pending {
+            draw(&mut app, &ctx, vec![]);
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.active_player().unwrap().raw.as_ref().unwrap().pts >= 0.8 - 0.000001);
+        // Merge into a tab stack: the hidden player must still advance.
+        let ((surface, node), _) = app.dock.iter_all_tabs().find(|(_, p)| p.id == 0).unwrap();
+        let first = app
+            .dock
+            .remove_tab((surface, node, egui_dock::TabIndex(0)))
+            .unwrap();
+        app.dock.push_to_first_leaf(first);
+        let ((surface, node), _) = app.dock.iter_all_tabs().next().unwrap();
+        app.dock
+            .set_active_tab((surface, node, egui_dock::TabIndex(0)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while app
+            .dock
+            .iter_all_tabs()
+            .find(|(_, p)| p.id == 0)
+            .unwrap()
+            .1
+            .raw
+            .as_ref()
+            .unwrap()
+            .pts
+            <= other_before + 0.1
+        {
+            draw(&mut app, &ctx, vec![]);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hidden tab must advance"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let closed = app
+            .dock
+            .remove_tab((surface, node, egui_dock::TabIndex(0)))
+            .unwrap();
+        let generation = closed.generation.clone();
+        let before = generation.load(Ordering::Relaxed);
+        drop(closed);
+        assert!(generation.load(Ordering::Relaxed) > before);
+        draw(&mut app, &ctx, vec![]);
+        assert_eq!(app.dock.iter_all_tabs().count(), 1);
+        assert!(app.active_player().unwrap().playing);
+    }
+
     #[test]
     #[ignore = "native reverse timing; optional NKG_BENCH_VIDEO"]
     fn cached_reverse_latency() {
@@ -1379,12 +2230,12 @@ mod playback_tests {
     }
     #[test]
     fn fractional_frame_time() {
-        assert_eq!(frame_label(0.0, 30.0, Some(60)), "帧 0 / 59");
-        assert_eq!(frame_label(59.0 / 30.0, 30.0, Some(60)), "帧 59 / 59");
-        assert_eq!(frame_label(2.0 / 30.0, 30.0, Some(3)), "帧 2 / 2");
-        assert_eq!(frame_label(0.0, 30.0, None), "帧 0");
-        assert_eq!(frame_label(0.0, 30.0, Some(1)), "帧 0 / 0");
-        assert_eq!(frame_label(0.0, 30.0, Some(0)), "帧 0");
+        assert_eq!(frame_label(0.0, 30.0, Some(60)), "视频帧数 0 / 59");
+        assert_eq!(frame_label(59.0 / 30.0, 30.0, Some(60)), "视频帧数 59 / 59");
+        assert_eq!(frame_label(2.0 / 30.0, 30.0, Some(3)), "视频帧数 2 / 2");
+        assert_eq!(frame_label(0.0, 30.0, None), "视频帧数 0");
+        assert_eq!(frame_label(0.0, 30.0, Some(1)), "视频帧数 0 / 0");
+        assert_eq!(frame_label(0.0, 30.0, Some(0)), "视频帧数 0");
         assert_eq!(time(59.0 / 30.0), "00:00:01.967");
         assert_eq!(time(2.0), "00:00:02.000");
         assert_eq!(time(0.0), "00:00:00.000");
