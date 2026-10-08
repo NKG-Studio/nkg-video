@@ -652,7 +652,7 @@ impl Player {
                             texture
                         });
                     ui.painter().image(logo.id(), egui::Rect::from_center_size(
-                        egui::pos2(drag_rect.right() - 17.0, drag_rect.center().y), Vec2::splat(26.0)),
+                        egui::pos2(drag_rect.left() + 17.0, drag_rect.center().y), Vec2::splat(26.0)),
                         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
                     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                     if drag.drag_started() {
