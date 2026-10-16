@@ -1,9 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-mod ai;
-mod ai_gpu;
 mod gpu;
 mod media;
 mod native;
+mod records;
 mod ui;
 fn main() -> eframe::Result {
     let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::default();

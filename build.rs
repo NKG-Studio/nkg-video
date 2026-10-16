@@ -10,22 +10,6 @@ fn main() {
             .compile()
             .expect("embed Windows application icon");
     }
-    println!("cargo:rerun-if-changed=src/ai.cpp");
-    println!("cargo:rerun-if-changed=tools/mediapipe/include");
-    assert!(
-        PathBuf::from(
-            "tools/mediapipe/include/mediapipe/tasks/c/vision/face_landmarker/face_landmarker.h"
-        )
-        .is_file(),
-        "Run scripts/setup-ai.ps1 first (MediaPipe C headers missing)"
-    );
-    cc::Build::new()
-        .cpp(true)
-        .file("src/ai.cpp")
-        .include("tools/mediapipe/include")
-        .flag_if_supported("/std:c++17")
-        .flag_if_supported("/EHsc")
-        .compile("nkg_ai");
     println!("cargo:rerun-if-changed=src/decode.c");
     println!("cargo:rerun-if-changed=src/gpu.cpp");
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");

@@ -21,38 +21,15 @@ https://visualstudio.microsoft.com/license-terms/
 Application source and build instructions:
 https://github.com/NKG-Studio/nkg-video
 
-## MediaPipe AI runtime and models
-
-AI analysis uses the unmodified Windows native C API from the official MediaPipe
-1.1.0 wheel, without Python. Headers are pinned to Google AI Edge MediaPipe commit
-821db8a4428baf58bf4c09a0330c937e6e0a3753 (v1.1.0):
-https://github.com/google-ai-edge/mediapipe/tree/821db8a4428baf58bf4c09a0330c937e6e0a3753
-The runtime's Apache-2.0 LICENSE and complete bundled dependency NOTICE are kept
-in tools/mediapipe and copied to ai/ in binary releases. The native adapter and
-WGSL effect implementation are part of NKG Video, not upstream MediaPipe code.
-
-Official Google models: Face Landmarker float16 v1, Pose Landmarker Lite float16
-v1, and Selfie Multiclass 256x256 float32 v1. Exact download URLs and SHA-256
-checksums for the wheel and all three model files are in scripts/setup-ai.ps1.
-Model documentation/cards:
-- https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker
-- https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker
-- https://storage.googleapis.com/mediapipe-assets/Model%20Card%20Multiclass%20Segmentation.pdf
-
-The optional local test fixtures are fetched from Google's mediapipe-assets
-bucket by scripts/make-ai-test-media.ps1. They are not bundled in binary releases.
-
 ## GPUImage shader formulas
 
-The color adjustments in src/alpha.wgsl are adapted from BradLarson/GPUImage,
+The exposure adjustment in src/alpha.wgsl is adapted from BradLarson/GPUImage,
 revision 167b0389bc6e9dc4bb0121550f91d8d5d6412c53:
 https://github.com/BradLarson/GPUImage/tree/167b0389bc6e9dc4bb0121550f91d8d5d6412c53/framework/Source
 
-Sources: GPUImageExposureFilter.m, GPUImageContrastFilter.m,
-GPUImageSaturationFilter.m (also grayscale), GPUImageSepiaFilter.m,
-GPUImageColorInvertFilter.m, GPUImageVignetteFilter.m and GPUImageColorMatrixFilter.m.
-Port changes: fused WGSL pass, adjustable sepia/vignette, explicit sRGB conversion,
-and linear-light alpha premultiplication. The framework itself is not bundled.
+Source: GPUImageExposureFilter.m.
+Port changes: WGSL exposure with explicit sRGB conversion and linear-light
+alpha premultiplication. The framework itself is not bundled.
 
 Copyright (c) 2012, Brad Larson, Ben Cochran, Hugues Lismonde, Keitaroh Kobayashi, Alaric Cole, Matthew Clark, Jacob Gundersen, Chris Williams.
 All rights reserved.

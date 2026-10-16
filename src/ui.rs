@@ -309,9 +309,6 @@ impl Player {
         self.playing = false;
         self.resume = resume && !at_end;
         self.seek_pending = true;
-        if let Some(display) = &mut self.gpu_display {
-            display.ai.invalidate();
-        }
         self.seek_value = position;
         self.seeking = false;
         self.error.clear();
@@ -386,13 +383,12 @@ impl Player {
     fn display(&mut self, frame: Frame, ctx: &egui::Context) {
         if let Some(media) = &self.media {
             if let Some(display) = &mut self.gpu_display {
-                display.begin_frame(frame.pts, ctx);
                 let result = if let Some(gpu) = &frame.gpu {
                     Some(display.show(gpu, media.width, media.height))
                 } else if media.alpha || display.effects_enabled() {
                     Some(display.show_rgba(&frame.rgba, media.width, media.height))
                 } else {
-                    // A disabled filter must not leave its last output on screen.
+                    // Resetting exposure must not leave its last output on screen.
                     display.clear();
                     None
                 };
@@ -427,11 +423,6 @@ impl Player {
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
-        let refresh_ai = self
-            .gpu_display
-            .as_mut()
-            .is_some_and(|display| display.poll_ai());
-        let previous_pts = self.raw.as_ref().map(|f| f.pts);
         if let Some(error) = self
             .audio
             .as_ref()
@@ -583,15 +574,6 @@ impl Player {
                 video.prefetch(frame.pts);
             }
         }
-        if refresh_ai
-            && !self.seek_pending
-            && self.pending.is_none()
-            && self.raw.as_ref().map(|f| f.pts) == previous_pts
-        {
-            if let Some(frame) = self.raw.take() {
-                self.display(frame, ctx);
-            }
-        }
         if self.playing {
             // Let the presentation/vsync loop pace playback. A 5 ms deferred
             // repaint can miss the next refresh and turn 60 fps into uneven 30/60.
@@ -600,10 +582,6 @@ impl Player {
             || self.seek_pending
             || self.step
             || (self.video.is_some() && self.next.is_none() && !self.eof)
-            || self
-                .gpu_display
-                .as_ref()
-                .is_some_and(|display| display.ai.pending())
         {
             ctx.request_repaint_after(Duration::from_millis(5));
         }
@@ -629,7 +607,7 @@ impl Player {
             Err(e) => self.browser_error = e.to_string(),
         }
     }
-    fn titlebar(ctx: &egui::Context) {
+    fn titlebar(ctx: &egui::Context, record_button: impl FnOnce(&mut egui::Ui)) {
         egui::TopBottomPanel::top("title")
             .exact_height(30.0)
             .frame(egui::Frame::new().fill(BG))
@@ -637,7 +615,7 @@ impl Player {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let (drag_rect, drag) = ui.allocate_exact_size(
-                        Vec2::new((ui.available_width() - 108.0).max(0.0), 30.0),
+                        Vec2::new((ui.available_width() - 188.0).max(0.0), 30.0),
                         egui::Sense::click_and_drag(),
                     );
                     let logo_id = egui::Id::new("app_logo");
@@ -661,6 +639,7 @@ impl Player {
                     if drag.double_clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
                     }
+                    record_button(ui);
                     if icon(ui, "minimize", "最小化").clicked() {
                         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
                     }
@@ -833,65 +812,14 @@ impl Player {
         );
         ui.checkbox(&mut self.checker, "透明棋盘格背景");
         if let Some(display) = &mut self.gpu_display {
-            let mut changed = ui
-                .add_enabled(
-                    !display.ai.settings.enabled,
-                    egui::Checkbox::new(&mut display.beauty, "美颜（磨皮 / 美白）"),
-                )
-                .on_hover_text("按肤色估计处理范围；启用 AI 后改用 AI 菜单中的皮肤磨皮 / 美白设置")
-                .changed();
-            ui.menu_button("视频滤镜", |ui| {
-                let filters = &mut display.filters;
-                let before = *filters;
-                ui.horizontal(|ui| {
-                    if ui.button("重置").clicked() {
-                        *filters = Default::default();
-                    }
-                    if ui.button("黑白").clicked() {
-                        *filters = crate::gpu::Filters {
-                            saturation: 0.0,
-                            ..Default::default()
-                        };
-                    }
-                    if ui.button("复古").clicked() {
-                        *filters = crate::gpu::Filters {
-                            sepia: 1.0,
-                            ..Default::default()
-                        };
-                    }
-                });
-                ui.add(egui::Slider::new(&mut filters.exposure, -2.0..=2.0).text("曝光 EV"));
-                ui.add(egui::Slider::new(&mut filters.contrast, 0.0..=2.0).text("对比度"));
-                ui.add(egui::Slider::new(&mut filters.saturation, 0.0..=2.0).text("饱和度"));
-                ui.add(egui::Slider::new(&mut filters.sepia, 0.0..=1.0).text("复古"));
-                ui.add(egui::Slider::new(&mut filters.vignette, 0.0..=1.0).text("暗角"));
-                ui.checkbox(&mut filters.invert, "反色");
-                changed |= *filters != before;
-            });
-            ui.menu_button("AI 美颜 / 美型 / 美体", |ui| {
-                let settings = &mut display.ai.settings;
-                let before = *settings;
-                ui.checkbox(&mut settings.enabled, "启用 AI 人像美化");
-                ui.add_enabled_ui(settings.enabled, |ui| {
-                    ui.add(egui::Slider::new(&mut settings.slim_face, 0.0..=1.0).text("瘦脸"));
-                    ui.add(egui::Slider::new(&mut settings.eyes, 0.0..=1.0).text("大眼"));
-                    ui.add(egui::Slider::new(&mut settings.chin, -1.0..=1.0).text("下巴"));
-                    ui.add(egui::Slider::new(&mut settings.smooth, 0.0..=1.0).text("皮肤磨皮"));
-                    ui.add(egui::Slider::new(&mut settings.white, 0.0..=1.0).text("皮肤美白"));
-                    ui.separator();
-                    ui.add(egui::Slider::new(&mut settings.waist, 0.0..=1.0).text("瘦腰"));
-                    ui.add(egui::Slider::new(&mut settings.slim_legs, 0.0..=1.0).text("瘦腿"));
-                    ui.add(egui::Slider::new(&mut settings.long_legs, 0.0..=1.0).text("长腿"));
-                });
-                ui.label("单人模式；身体关键点清晰可见时生效");
-                if !display.ai.status.is_empty() {
-                    ui.label(&display.ai.status);
+            let before = display.exposure;
+            ui.menu_button("曝光调整", |ui| {
+                ui.add(egui::Slider::new(&mut display.exposure, -2.0..=2.0).text("曝光 EV"));
+                if ui.button("重置").clicked() {
+                    display.exposure = 0.0;
                 }
-                if ui.button("恢复默认").clicked() {
-                    *settings = Default::default();
-                }
-                changed |= *settings != before;
             });
+            let changed = display.exposure != before;
             if changed {
                 if let Some(frame) = self.raw.take() {
                     self.display(frame, ctx);
@@ -1299,6 +1227,8 @@ pub struct App {
     // Keep the shared output stream alive until all player sinks have been dropped.
     output: Option<(OutputStream, OutputStreamHandle)>,
     recent: Vec<PathBuf>,
+    records: Option<crate::records::Records>,
+    record_error: String,
 }
 
 impl App {
@@ -1348,6 +1278,10 @@ impl App {
         let output = OutputStream::try_default().ok();
         let state = cc.wgpu_render_state.clone();
         let player = Player::new(0, state.clone(), output.as_ref().map(|(_, h)| h.clone()));
+        let records = std::env::current_exe().and_then(|path| {
+            crate::records::Records::load(path.with_file_name("qualified-videos.txt"))
+        });
+        let record_error = records.as_ref().err().map_or_else(String::new, |e| e.to_string());
         let mut app = Self {
             dock: egui_dock::DockState::new(vec![player]),
             active: 0,
@@ -1356,11 +1290,40 @@ impl App {
             render_state: state,
             output,
             recent: Vec::new(),
+            records: records.ok(),
+            record_error,
         };
         for path in std::env::args_os().skip(1) {
             app.open(PathBuf::from(path), &cc.egui_ctx);
         }
         app
+    }
+
+    fn record_button(&mut self, ui: &mut egui::Ui) {
+        let name = self.active_player()
+            .and_then(|p| p.media.as_ref())
+            .and_then(|m| m.path.file_name())
+            .and_then(|name| name.to_str()).map(str::to_owned);
+        let recorded = name.as_ref().is_some_and(|name| {
+            self.records.as_ref().is_some_and(|r| r.contains(name))
+        });
+        let label = if recorded { "已记录" } else { "记录" };
+        let response = ui.add_enabled_ui(name.is_some() && self.records.is_some(), |ui| {
+            ui.add_sized([80.0, 30.0], egui::Button::new(label).selected(recorded))
+        }).inner;
+        let hint = self.records.as_ref().map_or_else(
+            || "记录文件读取失败，请检查权限后重启播放器".to_owned(),
+            |r| format!("{}当前选中视频的文件名\n{}\n{}",
+                if recorded { "取消记录" } else { "记录合格的" },
+                name.as_deref().unwrap_or("请先打开视频"), display_path(&r.path)),
+        );
+        if response.on_hover_text(hint).clicked() {
+            if let (Some(records), Some(name)) = (&mut self.records, name) {
+                if let Err(e) = records.toggle(&name) {
+                    self.record_error = format!("{}\n{e}", display_path(&records.path));
+                }
+            }
+        }
     }
 
     fn active_player(&mut self) -> Option<&mut Player> {
@@ -1678,7 +1641,7 @@ impl App {
         let modal = self
             .dock
             .iter_all_tabs()
-            .any(|(_, p)| p.browser || p.information);
+            .any(|(_, p)| p.browser || p.information) || !self.record_error.is_empty();
         if !modal {
             for file in ctx.input(|i| i.raw.dropped_files.clone()) {
                 if let Some(path) = file.path {
@@ -1714,7 +1677,7 @@ impl App {
             modal || ctx.memory(|m| m.any_popup_open()));
         ctx.send_viewport_cmd(ViewportCommand::CursorVisible(!fullscreen || show_controls));
         if !fullscreen {
-            Player::titlebar(ctx);
+            Player::titlebar(ctx, |ui| self.record_button(ui));
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(if fullscreen { Color32::BLACK } else { BG }).inner_margin(0))
@@ -1756,6 +1719,24 @@ impl App {
             });
         if !self.close_requests.is_empty() {
             ctx.request_repaint();
+        }
+        if fullscreen && show_controls {
+            egui::Area::new(egui::Id::new("fullscreen_record"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0])
+                .show(ctx, |ui| self.record_button(ui));
+        }
+        if !self.record_error.is_empty() {
+            let mut close = false;
+            let response = egui::Modal::new(egui::Id::new("record_error")).show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                ui.heading("记录失败");
+                ui.label(&self.record_error);
+                close = ui.button("关闭").clicked();
+            });
+            if close || response.should_close() {
+                self.record_error.clear();
+            }
         }
         if browse {
             if self.active_player().is_none() {
@@ -1966,6 +1947,8 @@ mod playback_tests {
             render_state: None,
             output: None,
             recent: Vec::new(),
+            records: None,
+            record_error: String::new(),
         }
     }
 
